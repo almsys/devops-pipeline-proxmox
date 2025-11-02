@@ -201,8 +201,13 @@ pipeline {
                     withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
                         sh '''
                             export KUBECONFIG=${KUBECONFIG_FILE}
-                            kubectl wait --for=condition=available --timeout=60s deployment/boardgame-deployment
-                            kubectl get pods -o wide | grep boardgame
+                            #kubectl wait --for=condition=available --timeout=60s deployment/boardgame-deployment
+                            #kubectl get pods -o wide | grep boardgame
+                            # Короткое ожидание готовности
+                            kubectl wait --for=condition=ready \
+                            pod -l app=boardgame,managed-by=argocd \
+                            -n production \
+                            --timeout=60s                            
                         '''
                     }
                 }
@@ -211,10 +216,23 @@ pipeline {
 
         stage('Verify Deployment') {
             steps {
-                withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
+                withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {                    
                     sh """
-                        export KUBECONFIG=${KUBECONFIG_FILE}
-                        kubectl rollout status deployment/boardgame-deployment
+                        echo "✅ Verifying deployment in Kubernetes..."
+                        #export KUBECONFIG=${KUBECONFIG_FILE}
+                        #kubectl rollout status deployment/boardgame-deployment    
+                        echo "Checking pods..."
+                        kubectl get pods -n production -l app=boardgame -o wide
+                        
+                        echo "Checking deployment rollout status..."
+                        kubectl rollout status deployment/boardgame-deployment -n production --timeout=300s
+                        
+                        echo "Checking services..."
+                        kubectl get svc -n production -l app=boardgame
+                        
+                        echo "Checking replica status..."
+                        kubectl get deployment boardgame-deployment -n production -o jsonpath='{.status.availableReplicas}/{.status.replicas} pods available'
+                        echo ""
                     """
                 }
             }
@@ -226,18 +244,18 @@ pipeline {
             mail to: "${EMAIL_RECIPIENTS}",
                 subject: "✅ SUCCESS: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
                 body: """
-The Jenkins job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' completed successfully.
-
-📦 Deployment Details:
-- Image: ${HARBOR_URL}/${HARBOR_PROJECT}/${MY_APP}:${env.BUILD_NUMBER}
-- ArgoCD Application: ${MY_APP}
-- GitOps Repository: ${GITOPS_REPO}
-
-🔗 Links:
-- Build URL: ${env.BUILD_URL}
-- ArgoCD UI: https://${ARGOCD_SERVER}
-- Application: https://boardgame.local.lab
-"""
+                The Jenkins job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' completed successfully.
+                
+                📦 Deployment Details:
+                - Image: ${HARBOR_URL}/${HARBOR_PROJECT}/${MY_APP}:${env.BUILD_NUMBER}
+                - ArgoCD Application: ${MY_APP}
+                - GitOps Repository: ${GITOPS_REPO}
+                
+                🔗 Links:
+                - Build URL: ${env.BUILD_URL}
+                - ArgoCD UI: https://${ARGOCD_SERVER}
+                - Application: https://boardgame.local.lab
+                """
         }
         failure {
             mail to: "${EMAIL_RECIPIENTS}",
