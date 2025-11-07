@@ -25,7 +25,6 @@
   - [Этап 6: Установка K3s кластера](#этап-3-установка-k3s-кластера)
   - [Этап 7: MetalLB Load Balancer](#этап-4-установка-metallb-load-balancer)
   - [Этап 8: Traefik Ingress](#этап-5-установка-traefik-ingress)
-  - [Этап 9: Настройка внешнего доступа через Cloudflare Tunnel](#этап-6-настройка-внешнего-доступа-через-cloudflare-tunnel)
   - [Этап 10: Установка инструментов - jenkins, sonarqube, nexus, harbor, monitoring server](#этап-7-установка-инструментов-на-vm)
   - [Этап 10.1 Jenkins Server (192.168.100.20 порт 8080)](#10.1-Jenkins-Server)
   - [Этап 10.2 SonarQube Server](#10.2-sonarqube-server)
@@ -474,6 +473,20 @@ $TTL    604800
 100     IN      PTR     apps.local.lab.
 EOF
 ```
+Отключаем systemd-resolver отвечает за файл /etc/resolv.conf и автоматически подставляет свой адрес 127.0.0.53
+```bash
+# Отключаем systemd-resolved чтобы небыло адреса 127.0.0.53 в /etc/resolv.conf:
+sudo systemctl disable --now systemd-resolved
+# =========== Проверяем его статус =============
+echo Просмотр логов, нажмите CTRL+C
+sudo systemctl status systemd-resolved
+# Удаляем символическую ссылку на systemd-resolver
+sudo rm /etc/resolv.conf
+# Создаем новый resolv.conf с нашим сервером localhost где будет слушать теперь bind
+sudo tee /etc/resolv.conf > /dev/null <<'EOF'
+nameserver 127.0.0.1
+EOF
+```
 
 Проверьте конфигурацию и запустите:
 ```bash
@@ -489,6 +502,7 @@ sudo systemctl status named
 # Проверка
 dig @localhost jenkins.local.lab
 dig @localhost -x 192.168.100.20
+grep -rn "127.0.0.1" /etc/resolv.conf || echo "сервер 127.0.0.1 не найден в /etc/resolv.conf"
 ```
 
 #### 2.4 Настройка netplan для статических IP
@@ -529,11 +543,17 @@ sudo netplan apply
 #### 3.1 Создание Jumphost VM
 Создайте ВМ jumphost на Proxmox.
 
+
 #### 3.2 Настройка Jumphost
 
 Подключитесь:
 ```bash
 ssh ubuntu@10.0.10.102
+```
+
+Обновите пакеты 
+```bash
+sudo apt update -y
 ```
 
 Настройте netplan:
@@ -816,7 +836,8 @@ sudo systemctl start ngrok
 # Проверка статуса
 sudo systemctl status ngrok
 
-# Просмотр логов
+# Просмотр логов, нажмите CTRL+C
+echo Просмотр логов, нажмите CTRL+C
 sudo journalctl -u ngrok -f
 ```
 
@@ -936,6 +957,7 @@ echo "DNS: 192.168.100.53"
 echo ""
 echo "Тестирование DNS..."
 nslookup k3s-master.local.lab
+grep -rn "192.168.100.53" /etc/resolv.conf || echo "Сервер 192.168.100.53 не найден в /etc/resolv.conf"
 
 echo ""
 echo "Тестирование интернета..."
@@ -972,7 +994,7 @@ done
 
 # Для VM с двумя интерфейсами (jumphost уже настроен вручную)
 ```
-
+**Желательно скрипт запустить 2 раза, повторный для проверки, так как бывает что не прописывается DNS сервер**
 
 ### Проверка доступности интернета
 
@@ -993,64 +1015,6 @@ ping -c 4 google.com
 # Установка пакетов
 sudo apt update
 sudo apt install -y curl wget vim
-```
-
-
-#### 4.6 Альтернатива: Cloudflare Tunnel
-
-Если предпочитаете Cloudflare:
-```bash
-# Установка cloudflared
-wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-sudo dpkg -i cloudflared-linux-amd64.deb
-
-# Авторизация
-cloudflared tunnel login
-
-# Создание туннеля
-cloudflared tunnel create devops-pipeline
-
-# Конфигурация
-mkdir -p ~/.cloudflared
-
-tee ~/.cloudflared/config.yml > /dev/null <<'EOF'
-tunnel: YOUR_TUNNEL_ID
-credentials-file: /home/ubuntu/.cloudflared/YOUR_TUNNEL_ID.json
-
-ingress:
-  - hostname: jenkins.your-domain.com
-    service: http://192.168.100.20:8080
-  
-  - hostname: sonar.your-domain.com
-    service: http://192.168.100.30:9000
-  
-  - hostname: nexus.your-domain.com
-    service: http://192.168.100.31:8081
-  
-  - hostname: harbor.your-domain.com
-    service: http://192.168.100.32:80
-  
-  - hostname: grafana.your-domain.com
-    service: http://192.168.100.40:3000
-  
-  - hostname: "*.apps.your-domain.com"
-    service: http://192.168.100.100:80
-  
-  - service: http_status:404
-EOF
-
-# DNS записи
-cloudflared tunnel route dns devops-pipeline jenkins.your-domain.com
-cloudflared tunnel route dns devops-pipeline sonar.your-domain.com
-cloudflared tunnel route dns devops-pipeline nexus.your-domain.com
-cloudflared tunnel route dns devops-pipeline harbor.your-domain.com
-cloudflared tunnel route dns devops-pipeline grafana.your-domain.com
-cloudflared tunnel route dns devops-pipeline "*.apps.your-domain.com"
-
-# Запуск как сервис
-sudo cloudflared service install
-sudo systemctl start cloudflared
-sudo systemctl enable cloudflared
 ```
 
 #### 4.7 Настройка сети на Ngrok Gateway
@@ -1102,47 +1066,6 @@ dig jenkins.local.lab
 ip route show
 ```
 
-### Этап 5: Создание VM через Terraform
-
-#### 5.1 Структура Terraform проекта
-
-Настройки Terraform отдельно лежат в папке terraform
-
-#### 5.7 Развертывание VM
-
-```bash
-# Инициализация Terraform
-terraform init
-
-# Проверка плана
-terraform plan
-
-# Применение конфигурации
-terraform apply
-
-# Подтвердите: yes
-```
-
-⏱️ **Время выполнения: ~15 минут**
-
-Проверьте созданные VM:
-```bash
-terraform output
-
-# Тест подключения
-ssh -J ubuntu@10.0.10.102 ubuntu@192.168.100.10
-
-# Проверка DNS
-ssh -J ubuntu@10.0.10.102 ubuntu@192.168.100.10
-dig jenkins.local.lab
-ping -c 3 jenkins.local.lab
-
-# Проверка интернета (через NAT)
-ping -c 3 8.8.8.8
-curl -I https://google.com
-```
-
-
 ## Этап 6: Установка K3s кластера
 
 ### 6.1 Установка K3s Master Node
@@ -1162,13 +1085,15 @@ sudo apt update && sudo apt upgrade -y
 Установите K3s (без Traefik, установим позже):
 
 ```bash
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --node-ip=192.168.100.10" sh -
-export KUBECONFIG=~/.kube/config
-sudo mkdir ~/.kube 2> /dev/null
-sudo k3s kubectl config view --raw > "$KUBECONFIG"
-sudo chmod 600 "$KUBECONFIG"
-echo export KUBECONFIG=~/.kube/config  >> ~/.profile
-k3s server --tls-san k3s-master.local.lab
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server" sh -s - \
+	--disable traefik \
+        --write-kubeconfig-mode 644 \
+        --node-name k3s-master \
+        --cluster-domain local.lab \
+        --node-ip 192.168.100.10 \
+        --node-external-ip 192.168.100.10 \
+        --tls-san k3s-master.local.lab \
+        --tls-san 192.168.100.10 
 ```
 
 Получите токен для worker nodes:
@@ -1178,32 +1103,17 @@ sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 **Сохраните токен!** Пример: `K10abc123def456::server:xyz789`
 
-Проверьте статус:
+Проверька статуса запуска:
 
 ```bash
+# Ожидание запуска (30-60 секунд)
+sleep 60
+
+# Проверка статуса
 sudo systemctl status k3s
+
+# Проверка ноды
 sudo kubectl get nodes
-```
-Возможно еще понадобится отключить проверку SSL для Harbor хоста:
-```bash
-sudo mkdir -p /etc/rancher/k3s
-sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
-mirrors:
-  "harbor.local.lab":
-    endpoint:
-      - "https://harbor.local.lab"
-
-configs:
-  "harbor.local.lab":
-    tls:
-      insecure_skip_verify: true
-EOF
-
-sudo systemctl restart k3s
-```
-Проверка доступа k3s-master к образу на harbor сервере:
-```bash
-sudo crictl pull harbor.local.lab/library/myapp:139
 ```
 
 ### 6.2 Подключение Worker Nodes
@@ -1212,62 +1122,28 @@ sudo crictl pull harbor.local.lab/library/myapp:139
 
 ```bash
 ssh ubuntu@192.168.100.11
+```
+```bash
 
+
+sudo apt update && sudo apt upgrade -y
 curl -sfL https://get.k3s.io | K3S_URL=https://192.168.100.10:6443 \
   K3S_TOKEN="YOUR_TOKEN_FROM_MASTER" \
   sh -
-```
-Возможно еще понадобится отключить проверку SSL для Harbor хоста:
-```bash
-sudo mkdir -p /etc/rancher/k3s
-sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
-mirrors:
-  "harbor.local.lab":
-    endpoint:
-      - "https://harbor.local.lab"
-
-configs:
-  "harbor.local.lab":
-    tls:
-      insecure_skip_verify: true
-EOF
-
-sudo systemctl restart k3s-agent.service
-```
-Проверка доступа k3s-master к образу на harbor сервере:
-```bash
-sudo crictl pull harbor.local.lab/library/myapp:139
 ```
 **На k3s-worker2:**
 
 ```bash
 ssh ubuntu@192.168.100.12
-
+```
+```bash
+sudo apt update && sudo apt upgrade -y
 curl -sfL https://get.k3s.io | K3S_URL=https://192.168.100.10:6443 \
   K3S_TOKEN="YOUR_TOKEN_FROM_MASTER" \
   sh -
 ```
-Возможно еще понадобится отключить проверку SSL для Harbor хоста:
-```bash
-sudo mkdir -p /etc/rancher/k3s
-sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
-mirrors:
-  "harbor.local.lab":
-    endpoint:
-      - "https://harbor.local.lab"
 
-configs:
-  "harbor.local.lab":
-    tls:
-      insecure_skip_verify: true
-EOF
 
-sudo systemctl restart k3s-agent.service
-```
-Проверка доступа k3s-master к образу на harbor сервере:
-```bash
-sudo crictl pull harbor.local.lab/library/myapp:139
-```
 ### 6.3 Проверка кластера
 
 На master node:
@@ -1452,8 +1328,14 @@ helm install traefik traefik/traefik \
   --namespace traefik \
   --set service.type=LoadBalancer \
   --set ports.web.port=80 \
-  --set ports.websecure.port=443
+  --set ports.websecure.port=443 
 ```
+Добавление строк включают веб интерфейс traefik на порт 9000
+```
+--set additionalArguments="{--api.insecure=true,--api.dashboard=true}" \
+--set ports.traefik.port=9000
+```
+
 
 ### 8.3 Проверка
 
@@ -1464,104 +1346,13 @@ kubectl get svc -n traefik
 ```
 
 ---
-
-## Этап 9: Настройка внешнего доступа через Cloudflare Tunnel
-
-### 9.1 Установка cloudflared на Proxmox хосте
-
-```bash
-ssh root@10.0.10.200
-
-# Скачивание
-wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-sudo dpkg -i cloudflared-linux-amd64.deb
-
-# Аутентификация (откроет браузер)
-cloudflared tunnel login
-
-# Создание туннеля
-cloudflared tunnel create devops-pipeline
-```
-
-**Сохраните:**
-- Tunnel ID
-- Path to credentials file
-
-### 9.2 Конфигурация туннеля
-
-Создайте файл `/etc/cloudflared/config.yml`:
-
-```yaml
-tunnel: YOUR_TUNNEL_ID
-credentials-file: /root/.cloudflared/YOUR_TUNNEL_ID.json
-
-ingress:
-  # Jenkins
-  - hostname: jenkins.your-domain.com
-    service: http://192.168.100.20:8080
-  
-  # SonarQube
-  - hostname: sonar.your-domain.com
-    service: http://192.168.100.30:9000
-  
-  # Nexus
-  - hostname: nexus.your-domain.com
-    service: http://192.168.100.31:8081
-  
-  # Harbor
-  - hostname: harbor.your-domain.com
-    service: https://192.168.100.32
-    originServerName: harbor.your-domain.com
-  
-  # Grafana
-  - hostname: grafana.your-domain.com
-    service: http://192.168.100.40:3000
-  
-  # Приложения в K8s (wildcard)
-  - hostname: "*.apps.your-domain.com"
-    service: http://192.168.100.100:80
-  
-  # Catch-all
-  - service: http_status:404
-```
-
-### 9.3 Создание DNS записей
-
-```bash
-# Для каждого hostname создайте CNAME запись
-cloudflared tunnel route dns devops-pipeline jenkins.your-domain.com
-cloudflared tunnel route dns devops-pipeline sonar.your-domain.com
-cloudflared tunnel route dns devops-pipeline nexus.your-domain.com
-cloudflared tunnel route dns devops-pipeline harbor.your-domain.com
-cloudflared tunnel route dns devops-pipeline grafana.your-domain.com
-cloudflared tunnel route dns devops-pipeline "*.apps.your-domain.com"
-```
-
-### 9.4 Запуск туннеля как systemd сервиса
-
-```bash
-# Установка сервиса
-sudo cloudflared service install
-
-# Запуск
-sudo systemctl start cloudflared
-sudo systemctl enable cloudflared
-
-# Проверка статуса
-sudo systemctl status cloudflared
-
-# Просмотр логов
-sudo journalctl -u cloudflared -f
-```
-
-**Теперь все ваши сервисы доступны через HTTPS с автоматическими сертификатами!**
-
----
-
 ## Этап 10: Установка инструментов на VM
 
 ### 10.1 Jenkins Server (192.168.100.20 порт 8080)
 
+```bash
+ssh ubuntu@192.168.100.20
+```
 ```bash
 ssh ubuntu@192.168.100.20
 
@@ -1571,10 +1362,37 @@ sudo apt update && sudo apt upgrade -y
 # Установка Docker
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
-sudo usermod -aG docker ubuntu
-sudo usermod -aG docker jenkins
-sudo usermod -aG docker $USER
+```
+## Некоторые ошибки при работе Docker
+Ошибка: При работе этапа сборки контейнера Docker в пайплайне, может возникнуть ошибка "permision denied" :
+```
++ docker build -t harbor.local.lab/library/boardgame:2 .
 
+ERROR: permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Head "http://%2Fvar%2Frun%2Fdocker.sock/_ping": dial unix /var/run/docker.sock: connect: permission denied
+```
+Как исправить: Чтобы ее небыло, поправьте права для Docker:
+```bash
+sudo chmod 666 /var/run/docker.sock
+sudo systemctl restart docker
+sudo docker-compose ps
+```
+
+Ошибка: Docker не может соединится с Harbor потому-что у него самоподписанный сертификат, и что имя хоста не прописано в SAN, как резуультат в пайплайне видим "Unable docker login" или ошибку в логах:
+```
+Nov 06 09:05:52 jenkins dockerd[17233]: time="2025-11-06T09:05:52.411932345Z" level=info msg="Error logging in to endpoint, trying next endpoint" endpoint="{false https://harbor.local.lab false false false 0xc003a6e780}" error="Get \"https://harbor.local.lab/v2/\": tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead"
+Nov 06 09:05:52 jenkins dockerd[17233]: time="2025-11-06T09:05:52.411987949Z" level=error msg="Handler for POST /v1.51/auth returned error: Get \"https://harbor.local.lab/v2/\": tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead"
+
+```
+Как исправить:
+
+Добавляем цент сертификации Harbor в доверенные на машине Jenkins:
+```bash
+sudo scp admin@harbor.local.lab:/home/admin/harbor/ssl/harbor.local.lab.crt /usr/local/share/ca-certificates/harbor-ca.crt
+sudo update-ca-certificates
+sudo systemctl restart docker
+```
+Устанавливаем java17 и стартуем jenkins:
+```
 # Установка Java 17
 sudo apt install -y openjdk-17-jdk
 
@@ -1599,19 +1417,92 @@ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 **Доступ:** `http://192.168.100.20:8080`  
 **Пароль:** из файла initialAdminPassword (измените после первого входа)
 
+**Установка нужных прав для Jenkins**
+```bash
+sudo usermod -aG docker jenkins
+sudo usermod -aG docker $USER
+echo Проверка user jenkins  должен быть в группе docker
+sudo getent group docker
+```
+
 **Установка kubectl:**
 
-```bash
-sudo mkdir -p /var/lib/jenkins/.kube
-sudo scp admin@k3s-master.local.lab:/etc/rancher/k3s/k3s.yaml /var/lib/jenkins/.kube/config
-sudo sed -i 's/127.0.0.1/k3s-master.local.lab/g' /var/lib/jenkins/.kube/config
-sudo chown -R jenkins:jenkins /var/lib/jenkins/.kube
-sudo chmod 600 /var/lib/jenkins/.kube/config
 
-# Тест
-sudo -u jenkins kubectl get nodes
+```bash
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+kubectl version --client
+
+# Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+# ArgoCD CLI
+ARGOCD_VERSION=$(curl -s https://api.github.com/repos/argoproj/argo-cd/releases/latest | grep tag_name | cut -d '"' -f 4)
+curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64
+chmod +x argocd
+sudo mv argocd /usr/local/bin/
+argocd version --client
+
+# k9s (TUI для K8s)
+K9S_VERSION=$(curl -s https://api.github.com/repos/derailed/k9s/releases/latest | grep tag_name | cut -d '"' -f 4)
+wget https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_amd64.tar.gz
+tar -xzf k9s_Linux_amd64.tar.gz
+sudo mv k9s /usr/local/bin/
+rm k9s_Linux_amd64.tar.gz LICENSE README.md
+
+# kubectx и kubens
+sudo git clone https://github.com/ahmetb/kubectx /opt/kubectx
+sudo ln -s /opt/kubectx/kubectx /usr/local/bin/kubectx
+sudo ln -s /opt/kubectx/kubens /usr/local/bin/kubens
 ```
-Также нужно поменять адрес 127.0.0.1 при загрузке файла в jenkins credentials.
+
+Копирование kubeconfig:
+
+```bash
+mkdir -p ~/.kube
+
+sudo scp admin@k3s-master.local.lab:/etc/rancher/k3s/k3s.yaml ~/.kube/config
+# Если ошибка permission denied, от на k3s-master вводим команду sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+# После копирования, возвращаем права sudo chmod 600 /etc/rancher/k3s/k3s.yaml
+
+# Замена адреса сервера
+sed -i 's/127.0.0.1/k3s-master.local.lab/g' ~/.kube/config
+
+# Установка правильных прав
+chmod 600 ~/.kube/config
+
+# Проверка доступа
+kubectl get nodes
+kubectl cluster-info
+
+# Создание алиасов
+cat >> ~/.bashrc <<EOF
+
+# Kubernetes aliases
+alias k='kubectl'
+alias kgp='kubectl get pods'
+alias kgs='kubectl get svc'
+alias kgn='kubectl get nodes'
+alias kga='kubectl get all'
+alias kdp='kubectl describe pod'
+alias kl='kubectl logs'
+alias kex='kubectl exec -it'
+EOF
+
+source ~/.bashrc
+```
+
+Тестирование:
+
+```bash
+k get nodes
+k get pods -A
+k9s  # Интерактивный интерфейс
+```
+Примечание: При копировании config k3s мастера в Jenkins, возможно нужно поменять адрес 127.0.0.1 при загрузке файла через веб в jenkins credentials.
 
 **Установка Trivy:**
 
@@ -1622,19 +1513,34 @@ sudo apt update
 sudo apt install -y trivy
 ```
 
-**Установка Sonar cli scaner:**
-
-```bash
-wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189.zip -O /tmp/sonar-scanner-cli.zip
-sudo unzip /tmp/sonar-scanner-cli.zip -d /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner
-chown -R jenkins:jenkins /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner
-curl -X https://jenkins.local.lab:8080/restart
-```
 **Установка Maven:**
 
 ```bash
 sudo apt install -y maven
 mvn --version
+```
+## Некоторые ошибки при работе sonar и maven которые возникают из за прав
+**Установка нужных разрешений на каталог со сборщиком maven и сканером sonar cli, в этот каталог автоматически качаются нужные инструменты Jenkins'ом**
+
+В основном все файлы и каталоги внутри /var/lib/jenkins должны иметь похожие разрешения, иначе могут возникнуть проблемы с закачкой или запуском плагинов. Если прав нет, при старте пайплайна можно увидеть ошибки установки sonarscaner или maven: 
+```
+sonar-scanner
+— Use a tool from a predefined Tool Installation
+3s
+java.io.IOException: Failed to install https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/7.3.0.5189/sonar-scanner-cli-7.3.0.5189.zip to /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner
+```
+или
+```
+maven3.6
+— Use a tool from a predefined Tool Installation
+<1s
+java.io.IOException: Failed to install https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.5/apache-maven-3.9.5-bin.zip to /var/lib/jenkins/tools/hudson.tasks.Maven_MavenInstallation/maven3.6
+```
+Ставим нужные права на каталог tools чтобы избежать ошибок которые сверху:
+```bash
+sudo mkdir -p /var/lib/jenkins/tools/
+sudo chown -R jenkins:jenkins /var/lib/jenkins/tools/
+sudo chmod 755 -R /var/lib/jenkins/tools/
 ```
 
 **Доступ к Jenkins:** `https://jenkins.your-domain.com:8080`
@@ -1644,16 +1550,19 @@ mvn --version
 
 ```bash
 ssh ubuntu@192.168.100.30
-
+```
+```bash
 # Обновление системы
 sudo apt update && sudo apt upgrade -y
 
 # Установка Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl vim openssl docker.io docker-compose
+sudo systemctl enable docker --now
+docker --version
+docker-compose --version
+sudo usermod -aG docker $USER
 sudo usermod -aG docker ubuntu
-sudo apt-get install -y uidmap && dockerd-rootless-setuptool.sh install
-
 
 # Настройка системы для SonarQube
 sudo sysctl -w vm.max_map_count=524288
@@ -1661,7 +1570,7 @@ sudo sysctl -w fs.file-max=131072
 echo "vm.max_map_count=524288" | sudo tee -a /etc/sysctl.conf
 echo "fs.file-max=131072" | sudo tee -a /etc/sysctl.conf
 
-sudo tee docker-compose.yml > /dev/null <<EOF
+sudo tee docker-compose.yml > /dev/null <<'EOF'
 services:
   db:
     image: postgres:15
@@ -1685,18 +1594,83 @@ services:
 
 EOF
 ```
-# Запуск SonarQube 
-Нужно пождать 3-5 минут
-```bash
-sudo docker compose up -d
+
+
+**Примечание:**    По умолчанию контейнер SonarQube и Postgresql стирают свои данные при перезапуске (sudo docker-compose down).  Поэтому нужно создать другой yaml файл с persistent volume, то есть хранением данных на хостовой машине. Вот пример постоянной машины Sonarqube:
 ```
+sudo tee docker-compose.yml > /dev/null <<EOF
+services:
+  db:
+    image: postgres:15
+    container_name: sonarqube_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonarqube
+    volumes:
+      - sonarqube_db_data:/var/lib/postgresql/data
+
+  sonarqube:
+    image: sonarqube:25.10.0.114319-community
+    container_name: sonarqube
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonarqube
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+    ports:
+      - "9000:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+
+volumes:
+  sonarqube_db_data:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+EOF
+```
+
+
+### Запуск SonarQube если он не запущен
+
+```bash
+sudo docker-compose up -d
+```
+Нужно пождать 3-5 минут пока скачаются docker образы sonarqube и postgresql.
+
 **Проверка:**
 ```bash
+sudo docker-compose logs
 sudo docker ps
 sudo docker logs -f admin-sonarqube-1
 sudo docker logs -f sonarqube_db
 
 ```
+**Настройка Webhook для этапа QualityGate:**
+Нужно обязательно настроить веб хуки для Jenkins, когда код проекта будет проверен, SonarQube отправит вебхук в Jenkins, что проверка завршена. В противном случае,задание Quality Gate будет висеть минут 5 и потом вывалится в ошибку, так как Jenkins не получил веб хук от SonarQube.
+
+
+- **Указываем адрес хоста SonarQube чтобы при отправке webhook формировался верный json:** Administration → Congiguration → General Settings → Server base URL → http://sonar.local.lab:9000
+- **Создаем вебхук идем в меню Administration:**
+Administration -> Configuration -> Webhooks -> Create
+Project -> Boardgame -> Project Settings -> Webhooks -> Create
+- Name: jenkins-webhook
+- URL: http://jenkins.local.lab:8080/sonarqube-webhook/
+- Create
+
+**Также можно повешать вебхуки на отдельный проект**
+Project -> Boardgame -> Project Settings -> Webhooks -> Create
+
+
+
+<img width="1100" height="755" alt="image" src="https://github.com/user-attachments/assets/ae38f361-e5f3-49be-8548-fa819e3c0cc0" />
+Веб интерфейс sonarqube.
 
 **Доступ:** `https://sonar.your-domain.com:9000`  
 **Логин:** admin/admin (измените после первого входа)
@@ -1705,15 +1679,22 @@ sudo docker logs -f sonarqube_db
 
 ```bash
 ssh ubuntu@192.168.100.31
+```
+
+```bash
+
 
 # Обновление системы
 sudo apt update && sudo apt upgrade -y
 
 # Установка Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo apt-get install -y uidmap && dockerd-rootless-setuptool.sh install
-
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl vim openssl docker.io docker-compose
+sudo systemctl enable docker --now
+docker --version
+docker-compose --version
+sudo usermod -aG docker $USER
+sudo usermod -aG docker ubuntu
 
 # Запуск Nexus
 sudo docker run -d \
@@ -1723,8 +1704,8 @@ sudo docker run -d \
   -v nexus-data:/nexus-data \
   sonatype/nexus3
 
-# Ожидание запуска (~2 минуты)
-sleep 120
+# Ожидание запуска (~15  секунд)
+sleep 15
 
 # Получение initial admin password
 sudo docker exec nexus cat /nexus-data/admin.password; echo
@@ -1732,6 +1713,8 @@ sudo docker exec nexus cat /nexus-data/admin.password; echo
 
 **Доступ:** `https://nexus.your-domain.com:8081`  
 **Логин:** admin + пароль из команды выше
+
+Примечание: При установке Nexus по умолчанию создаются 2 репозитория **maven-releases** и **maven-snapshots**. Если их нет, нужно будет создать. 
 
 **Создание репозиториев:**
 1. Sign in
@@ -1743,14 +1726,18 @@ sudo docker exec nexus cat /nexus-data/admin.password; echo
 
 ```bash
 ssh ubuntu@192.168.100.32
+```
+```bash
 
 # Обновление системы
 sudo apt update && sudo apt upgrade -y
 
 # Установка Docker и Docker Compose
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl vim openssl docker.io docker-compose
+sudo systemctl enable docker --now
+docker --version
+docker-compose --version
 
 # Скачивание Harbor
 cd ~
@@ -1761,20 +1748,46 @@ cd harbor
 # Конфигурация
 cp harbor.yml.tmpl harbor.yml
 ```
+## Некоторые ошибки при работе Harbor
+**Настройка SSL для Harbor:**
+По сути Harbor может работать по HTTP, внутри локальной сети это безопасно, так как закрытый контур. Но для большей безопасности, можно настроить HTTPS доступ. Правильная настройка SSL важна, так как могут возникнуть ошибки доступа, например:
+```
+Hmmm… can't reach this page It looks like the webpage at https://harbor.local.lab/harbor/projects might be having issues, or it may have moved permanently to a new web address. ERR_SSL_KEY_USAGE_INCOMPATIBLE
+```
+**Важные замечания:** Настройки генерации сертификата san.cnf должны содержать блок для корректной работы nginx, chrome, edge:
+```
+[v3_req]
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+```
+Почему это важно:
+- digitalSignature — разрешает использовать сертификат для установления TLS-соединения (подписание сессии).
+- keyEncipherment — разрешает шифрование ключей в процессе обмена.
+- dataEncipherment в браузерах не нужен и иногда вызывает конфликт (особенно в Chrome).
+- 
+**Если данного блока не будет - Chrome/Edge увидят, что сертификат «не предназначен для TLS-аутентификации», и покажут ошибку ERR_SSL_KEY_USAGE_INCOMPATIBLE**
 
-Настройка SSL для Harbor:
+Генерация ключей без sudo, если будет через sudo, владельцем ключей станет учетная запись root, из за этого harbor не будет видет ключи.
 ```bash
-# Генерация приватного ключа
-mkdir ~/harbor/ssl
-cd ~/harbor/
-sudo openssl genrsa -out harbor.local.lab.key 2048
+mkdir -p ~/harbor/ssl
+cd ~/harbor/ssl
+# Создаем собственной центр сертификации
+# Здесь ca.key — приватный ключ вашей CA.
+openssl genrsa -out ca.key 4096         
+ # ca.crt — корневой сертификат, который будет подписывать серверные сертификаты, в нашем случае Harbor.
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -out ca.crt -subj "/CN=MyHarborCA"        
 
-# Генерация самоподписанного сертификата
-sudo openssl req -new -x509 -key harbor.local.lab.key -out harbor.local.lab.crt -days 3650 -subj "/CN=harbor.local.lab"
+# Генерация приватного ключа и запроса для Harbor сервера
+# harbor.local.lab.key — приватный ключ Harbor.
+# harbor.local.lab.csr — запрос на сертификат (CSR), который потом подпишет наша CA.
+openssl genrsa -out harbor.local.lab.key 4096
+openssl req -new -key harbor.local.lab.key -out harbor.local.lab.csr -subj "/CN=harbor.local.lab"
 
-# Вариант 2: С дополнительными доменными именами (SAN)
-# Создание конфигурационного файла
-sudo tee openssl.cnf > /dev/null <<EOF
+# Создание SAN-конфига
+# Этот файл указывает все имена (SAN) - harbor.local.lab. 192.168.100.32, 127.0.0.1
+# по которым сертификат будет считаться валидным. 
+sudo tee san.cnf > /dev/null <<EOF
 [req]
 distinguished_name = req_distinguished_name
 x509_extensions = v3_req
@@ -1789,7 +1802,7 @@ OU = Organizational Unit
 CN = harbor.local.lab
 
 [v3_req]
-keyUsage = keyEncipherment, dataEncipherment
+keyUsage = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 
@@ -1797,31 +1810,28 @@ subjectAltName = @alt_names
 DNS.1 = harbor.local.lab
 DNS.2 = localhost
 IP.1 = 127.0.0.1
+IP.2 = 192.168.100.32
 EOF
 
-# Генерация ключа и сертификата
-sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-    -keyout harbor.local.lab.key \
-    -out harbor.local.lab.crt \
-    -config openssl.cnf \
-    -extensions v3_req
+# Подписание серверного сертификата CA
+openssl x509 -req -in harbor.local.lab.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out harbor.local.lab.crt -days 3650 -sha256 -extfile san.cnf -extensions v3_req
 
-# 3. Проверка созданных файлов
-# Проверить права доступа
-sudo ls -la ~/harbor/ssl/
-
-# Проверить содержимое сертификата
-sudo openssl x509 -in harbor.local.lab.crt -text -noout
+```
+Проверка что сертификат выписан на хост harbor.local.lab:
+```
+openssl x509 -in harbor.local.lab.crt -noout -text | grep -A1 "Subject Alternative Name"
 ```
 Отредактируйте `harbor.yml`:
 
 ```bash
+cd ..
 nano harbor.yml
 ```
 
 Измените:
 
 ```yaml
+# hostname harbor.local.lab
 hostname: harbor.your-domain.com
 
 # https:
@@ -1832,8 +1842,9 @@ hostname: harbor.your-domain.com
 #   certificate: /your/certificate/path
 #   private_key: /your/private/key/path
 port: 443
-certificate: ~/ssl/harbor/ssl/harbor.local.lab.crt
-private_key: ~/ssl/harbor/ssl/harbor.local.lab.key
+# #абсолютные пути
+certificate: /home/admin/harbor/ssl/harbor.local.lab.crt
+private_key: /home/admin/harbor/ssl/harbor.local.lab.key
 
 harbor_admin_password: YourSecurePassword123!
 
@@ -1842,23 +1853,49 @@ database:
 
 data_volume: /data
 ```
+Здесь важно поменять:
+- hostname:
+- port и пути к сертификатам
 
 Установка:
 
 ```bash
 sudo ./install.sh
 ```
+<img width="1889" height="709" alt="image" src="https://github.com/user-attachments/assets/3f4cc9ac-1bb5-44bc-bda4-d1c0dcd983ab" />
+Успешный запуск Harbor.
 
 **Проверка:**
-
 ```bash
-sudo chmod 666 /var/run/docker.sock
+cd ~/harbor
 sudo docker-compose ps
+
 ```
+Примерный вывод:
+```bash
+admin@harbor:~/harbor$ sudo docker compose ps
+WARN[0000] /home/admin/harbor/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion 
+NAME                IMAGE                                COMMAND                  SERVICE       CREATED         STATUS                   PORTS
+harbor-core         goharbor/harbor-core:v2.9.0          "/harbor/entrypoint.…"   core          6 minutes ago   Up 6 minutes (healthy)   
+harbor-db           goharbor/harbor-db:v2.9.0            "/docker-entrypoint.…"   postgresql    6 minutes ago   Up 6 minutes (healthy)   
+harbor-jobservice   goharbor/harbor-jobservice:v2.9.0    "/harbor/entrypoint.…"   jobservice    6 minutes ago   Up 5 minutes (healthy)   
+harbor-log          goharbor/harbor-log:v2.9.0           "/bin/sh -c /usr/loc…"   log           6 minutes ago   Up 6 minutes (healthy)   127.0.0.1:1514->10514/tcp
+harbor-portal       goharbor/harbor-portal:v2.9.0        "nginx -g 'daemon of…"   portal        6 minutes ago   Up 6 minutes (healthy)   
+nginx               goharbor/nginx-photon:v2.9.0         "nginx -g 'daemon of…"   proxy         6 minutes ago   Up 6 minutes (healthy)   0.0.0.0:80->8080/tcp, [::]:80->8080/tcp, 0.0.0.0:443->8443/tcp, [::]:443->8443/tcp
+redis               goharbor/redis-photon:v2.9.0         "redis-server /etc/r…"   redis         6 minutes ago   Up 6 minutes (healthy)   
+registry            goharbor/registry-photon:v2.9.0      "/home/harbor/entryp…"   registry      6 minutes ago   Up 6 minutes (healthy)   
+registryctl         goharbor/harbor-registryctl:v2.9.0   "/home/harbor/start.…"   registryctl   6 minutes ago   Up 6 minutes (healthy)   
+
+```
+
+
+========================================
 **Доп. команды:***
 
 Автозапуск Harbor при перезагрузке:
 ```bash
+cd ~/harbor
+# Ставим unless-stopped вместо always, так как при always контейнер всегда пытается перезапустится даже если сбой, unless-stopped если сбой останаливает работу
 sed -i 's/restart: always/restart: unless-stopped/' docker-compose.yml
 sudo docker-compose down -v
 sudo docker-compose up -d
@@ -1889,7 +1926,7 @@ sudo systemctl status harbor.service
 ```
 Проверяем запущены ли контейнеры:
 ```bash
-docker ps
+sudo docker ps
 ```
 Примерный вывод:
 ```
@@ -1910,25 +1947,86 @@ fb403461790f   goharbor/harbor-registryctl:v2.9.0   "/home/harbor/start.…"   1
 **Доступ:** `https://harbor.your-domain.com`  
 **Логин:** admin/YourSecurePassword123!
 
+Примечание: При первой установке Harbor создается библиотека library, если ее нет создайте в ручную через настрйку проекта снизу.
+
 **Настройка проекта:**
 1. Projects → NEW PROJECT
 2. Project Name: `library`
 3. Access Level: Public
 4. OK
 
+
+## Некоторые ошибки при работе k3s нод с хранилищем Harbor, ноды проверяют валидность сертификата и выдают ошибку если он самоподписанный
+**k3s-master и worker ноды k3s-worker-1 и k3s-worker-2 проверяют сертификат Harbor, так как он самоподписанный, возникает ошибка:**
+
+```
+E1106 14:42:23.565238   11549 log.go:32] "PullImage from image service failed" err="rpc error: code = Unknown desc = failed to pull and unpack image \"harbor.local.lab/library/boardgame:65\": failed to resolve reference \"harbor.local.lab/library/boardgame:65\": failed to do request: Head \"https://harbor.local.lab/v2/library/boardgame/manifests/65\": tls: failed to verify certificate: x509: certificate signed by unknown authority" image="harbor.local.lab/library/boardgame:65"
+FATA[0000] pulling image: failed to pull and unpack image "harbor.local.lab/library/boardgame:65": failed to resolve reference "harbor.local.lab/library/boardgame:65": failed to do request: Head "https://harbor.local.lab/v2/library/boardgame/manifests/65": tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+Поэтому нужно отключить отключить проверку SSL для Harbor хоста на всех 3 нодах кластера k3s-master и 2-х worker:
+```bash
+sudo mkdir -p /etc/rancher/k3s
+sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
+mirrors:
+  "harbor.local.lab":
+    endpoint:
+      - "https://harbor.local.lab"
+
+configs:
+  "harbor.local.lab":
+    tls:
+      insecure_skip_verify: true
+EOF
+```
+Перезапуск на master ноде:
+```bash
+sudo systemctl restart k3s
+```
+Перезапуск на worker1 и worker2 ноде:
+```bash
+sudo systemctl restart k3s-agent
+```
+
+Проверка доступа k3s-master и worker1-2 нодах к образу на harbor сервере, должна быть закачка:
+```bash
+sudo crictl pull harbor.local.lab/library/myapp:139
+# Примерный вывод
+echo "Image is up to date for sha256:12ed91993dd46b4a37671240000ad784d159759ad52a3f35fac225a99f12f59b"
+```
+
+## Ошибка при работе с jenkins: Docker на машине Jenkins не может соединится с Harbor потому-что у него самоподписанный сертификат, и что имя хоста не прописано в SAN, как резуультат в пайплайне видим "Unable docker login" или ошибку в логах:
+```
+Nov 06 09:05:52 jenkins dockerd[17233]: time="2025-11-06T09:05:52.411932345Z" level=info msg="Error logging in to endpoint, trying next endpoint" endpoint="{false https://harbor.local.lab false false false 0xc003a6e780}" error="Get \"https://harbor.local.lab/v2/\": tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead"
+Nov 06 09:05:52 jenkins dockerd[17233]: time="2025-11-06T09:05:52.411987949Z" level=error msg="Handler for POST /v1.51/auth returned error: Get \"https://harbor.local.lab/v2/\": tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead"
+
+```
+Как исправить:
+
+Переходим на машину Jenkins и добавляем центр сертификации Harbor в доверенные:
+```bash
+sudo scp admin@harbor.local.lab:/home/admin/harbor/ssl/harbor.local.lab.crt /usr/local/share/ca-certificates/harbor-ca.crt
+sudo update-ca-certificates
+sudo systemctl restart docker
+```
+
 ### 10.5 Monitoring Server (192.168.100.40)
 
 ```bash
 ssh ubuntu@192.168.100.40
+```
+
+```bash
+
 
 # Обновление системы
 sudo apt update && sudo apt upgrade -y
 
 # Установка Docker и Docker Compose
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo apt install -y docker-compose
-sudo apt-get install -y uidmap && dockerd-rootless-setuptool.sh install
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl vim openssl docker.io docker-compose
+sudo systemctl enable docker --now
+docker --version
+docker-compose --version
 
 
 # Создание структуры директорий
@@ -2208,6 +2306,8 @@ EOF
 ```bash
 # На jumphost
 ssh admin@192.168.100.10
+```
+```bash
 kubectl create serviceaccount prometheus -n kube-system
 kubectl create clusterrolebinding prometheus --clusterrole=cluster-admin --serviceaccount=kube-system:prometheus
 kubectl -n kube-system create token prometheus
@@ -2227,16 +2327,136 @@ echo "YOUR_K3S_TOKEN" > ~/monitoring/prometheus/k3s-token
 
 ```bash
 cd ~/monitoring
-docker-compose up -d
+sudo docker-compose up -d
 
 # Проверка
-docker-compose ps
-docker-compose logs -f
+sudo docker-compose ps
+sudo docker-compose logs -f
 ```
 
 **Доступ:**
-- Prometheus: `https://grafana.your-domain.com:9090` (будет через Grafana)
-- Grafana: `https://grafana.your-domain.com:3000` (admin/admin)
+- Prometheus: `http://prometheus.local.lab:9090` или лучше http://monitoring.local.lab:9090 (будет через Grafana)
+- Grafana: `http://grafana.local.lab:3000` (admin/admin) или лучше http://monitoring.local.lab:3000
+- По умолчанию доступ только по http без шифрования
+
+## Настройка nginx reversy proxy для включения доступ к контейнерам по HTTPS
+Чтобы заработало HTTPS шифрование по самоподписанному сертификату нужно настроить nginx reversy proxy.
+Сертификат создадим для следующих URL (SAN) - monitoring.local.lab, grafana.local.lab, prometheus.local.lab
+
+**Важные замечания:** Сертификат должен отвечать за разные доменные имена grafana.local.lab (CNAME в DNS на хост monitoring.local.lab), prometeus.local.lab (CNAME в DNS на хост monitoring.local.lab) и montiring.local.lab. Чтобы создать такой сертификат, нужно использовать SAN (один сертификат на для множества доменов). Права на файлы сертификата обязательно должны принадлежать локальному неприлегированному пользователю admin из под которого запускается docker (compose). 
+
+```bash
+sudo apt install -y nginx
+sudo mkdir -p /etc/ssl/monitoring
+cd /etc/ssl/monitoring
+sudo tee san.cnf > /dev/null <<'EOF'
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = KZ
+ST = State
+L = City
+O = DevOps
+OU = Monitoring
+CN = monitoring.local.lab
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = monitoring.local.lab
+DNS.2 = grafana.local.lab
+DNS.3 = prometheus.local.lab
+DNS.4 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+sudo openssl genrsa -out monitoring.key 4096
+sudo openssl req -new -key monitoring.key -out monitoring.csr -subj "/CN=monitoring.local.lab"
+sudo openssl x509 -req -in monitoring.csr -signkey monitoring.key -out monitoring.crt -days 3650 -extfile san.cnf
+sudo ls /etc/ssl/monitoring/
+# Получаем 2 файла  monitoring.crt и monitoring.key, которые можно использовать для всех трёх доменов.
+```
+Настройка самого nginx reversy proxy:
+```bash
+sudo tee /etc/nginx/sites-available/monitoring.conf > /dev/null << 'EOF'
+# ========================
+# Grafana
+# ========================
+server {
+    listen 443 ssl;
+    server_name grafana.local.lab monitoring.local.lab;
+
+    ssl_certificate /etc/ssl/monitoring/monitoring.crt;
+    ssl_certificate_key /etc/ssl/monitoring/monitoring.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+
+# ========================
+# Prometheus
+# ========================
+server {
+    listen 443 ssl;
+    server_name prometheus.local.lab;
+
+    ssl_certificate /etc/ssl/monitoring/monitoring.crt;
+    ssl_certificate_key /etc/ssl/monitoring/monitoring.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:9090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+
+# ========================
+# HTTP → HTTPS redirect
+# ========================
+server {
+    listen 80;
+    server_name grafana.local.lab prometheus.local.lab monitoring.local.lab;
+    return 301 https://$host$request_uri;
+}
+
+EOF
+```
+Активация конфига и перезапуск nginx:
+```bash
+sudo ln -s /etc/nginx/sites-available/monitoring.conf /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+**Доступ:**
+Итого можно теперь заходить по https 
+- `https://grafana.local.lab`
+- `https://prometheus.local.lab`
+Не шифрованный доступ 
+- Prometheus: `http://prometheus.local.lab:9090` или (`http://monitoring.local.lab:9090`)
+- Grafana: `http://grafana.local.lab:3000` (admin/admin) или (`http://monitoring.local.lab:3000`)
+
+
+=========Возможно нужно удалить============================
+Сохранение k3s конфига в ~/.kube/config
+```bash
+export KUBECONFIG=~/.kube/config
+sudo mkdir ~/.kube 2> /dev/null
+sudo k3s kubectl config view --raw > "$KUBECONFIG"
+sudo chmod 600 "$KUBECONFIG"
+echo export KUBECONFIG=~/.kube/config  >> ~/.profile
+```
+=========Возможно нужно удалить============================
 
 ---
 
@@ -2264,11 +2484,16 @@ docker-compose logs -f
 - Maven Integration
 - Pipeline Maven Integration
 - Prometheus metrics
-- Email Extension Plugin   (есть только Email Extension Template)
+- Email Extension Template
+- Generic Webhook Trigger (включение веб хуков)
+- Eclipse Temurin installer (позволяет устанавливать разные версии Java с сайта adoptium.net)
 - Blue Ocean (опционально, для красивого UI)
+- Pipeline Stage View (еще один красивый UI)
 - CloudBees Disk Usage Simple (для Prometheus)
 
-После установки: **Restart Jenkins**
+
+После установки:  ✓  **Restart Jenkins** или пройти по ссылке http://jenkins.local.lab:8080/restart
+
 
 ### 11.3 Настройка Tools
 
@@ -2277,12 +2502,12 @@ docker-compose logs -f
 **JDK:**
 - Name: `java17`
 - ✓ Install automatically
-- Version: OpenJDK 17
+Примечание: Также можно установить версию Version: jdk-17.0.9 , нужно выбрать - ✓ Install from adoptium.net)
 
 **Maven:**
 - Name: `maven3.6`
 - ✓ Install automatically
-- Version: 3.9.5
+- Version: 3.6.1
 
 **Docker:**
 - Name: `docker`
@@ -2291,16 +2516,43 @@ docker-compose logs -f
 
 **SonarQube Scanner:**
 - Name: `sonar-scanner`
-- ✓ Install automatically
+- ✓ Install automatically (можно не отмечать так мы установим в ручную внизу)
 - Version: Latest
+
+**Установка Sonar cli scaner:**
+```bash
+wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189.zip -O /tmp/sonar-scanner-cli.zip
+sudo mkdir -p /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner
+sudo unzip /tmp/sonar-scanner-cli.zip -d /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner
+sudo chown -R jenkins:jenkins /var/lib/jenkins/tools/
+sudo chmod 755 -R /var/lib/jenkins/tools/
+sudo ln -s /var/lib/jenkins/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner/sonar-scanner-7.3.0.5189/bin/sonar-scanner /usr/local/bin/sonar-scanner
+```
+**Новая установка Sonar cli scaner (ручная):**
+```bash
+wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189.zip -O /tmp/sonar-scanner-cli.zip
+sudo mkdir -p /opt/sonar-scanner
+sudo unzip /tmp/sonar-scanner-cli.zip -d /opt/sonar-scanner 
+# Узнаем версию сканера:
+ls /opt/sonar-scanner
+sonar-scanner-7.3.0.5189
+# Добавляем в PATH путь к сканеру:
+sudo echo "export PATH=/opt/sonar-scanner/sonar-scanner-7.3.0.5189/bin:$PATH" >> /home/admin/.profile
+# Применяем изминения
+source /home/admin/.profile
+# Проверка установки, вывод help по сканеру
+sonar-scanner -h
+```
 
 ### 11.4 Настройка Credentials
 
 **Manage Jenkins → Manage Credentials → Global → Add Credentials**
+Когда Jenkins запускает Pipeline из файла jenkinsfile, он ищет авторизационные данные по ID. Поэтому нужно сверить ID из Jenkinsfile с ID в веб интерфейсе - они должны совпадать.
 
 **1. GitHub Token:**
-- Kind: Secret text
-- Secret: `<your-github-personal-access-token>`
+- Kind: Username with password
+- name: https://github.com/-----> NAME <---/Boardgame, у меня здесь sysops8
+- Secret: `<your-github-personal-access-token>`- 
 - ID: `github-token`
 - Description: GitHub Access Token
 
@@ -2324,8 +2576,9 @@ Scopes: repo, admin:repo_hook
 - Description: SonarQube Authentication Token
 
 **Как создать SonarQube Token:**
+Справа в верхнем углу есть настройка My Account:
 ```
-SonarQube → "My Account → Security → Generate Tokens
+SonarQube → "My Account → Security → Generate Tokens  →  User token  → Generate
 ```
 
 **4. Kubernetes Config:**
@@ -2334,6 +2587,7 @@ SonarQube → "My Account → Security → Generate Tokens
 - ID: `k8s-kubeconfig`
 - Description: Kubernetes Config
 - Внутри файла поменять адрес 127.0.0.1 на k3s-master.local.lab и только потом загружать в jenkins
+- Примечание: файл config можно взять с jumphost, jenkins хоста или непосредственно с k3s-master ноды поменяв внутри 127.0.0.1 на DNS имя k3s-master.local.lab 
 
 **5. Gmail App Password:**
 - Kind: Username with password
@@ -2348,27 +2602,35 @@ Google Account → Security → 2-Step Verification → App passwords → Jenkin
 ```
 **6. Nexus:**
 - Kind: Username with password
-- Username: `jenkins`
+- Username: `admin`
 - Password: `<your-nexus-password>`
-- ID: `nexus-cred`
+- ID: `nexus-creds`
 - Description: Nexus Credentials
 - Пользователя jenkins нужно создать на сервере nexus и дать ему права админа.
   
-### 11.5 Настройка SonarQube Server
+### 11.5 Настройка SonarQube Server в Jenkins
 
-**Manage Jenkins → Configure System → SonarQube servers**
+**Manage Jenkins →  System → SonarQube servers**
 
 - ✓ Enable injection of SonarQube server configuration
+- ✓ Environment variables
+- ✓ Add SonarQube 
 - Name: `SonarQube`
-- Server URL: `http://192.168.100.30:9000`
+- Server URL: `http://192.168.100.30:9000` или `http://sonar.local.lab:9000`
 - Server authentication token: Select `sonar-token`
 
 ### 11.6 Настройка Maven Settings
 
 **Manage Jenkins → Managed files → Add a new Config → Global Maven settings.xml**
-
+Настройки репозитория в settings.xml должны совпадать с github.com/username/boardgame/pom.xml, важно чтобы ID репозиториев совпадали.
+То есть имя репозитория <id>nexus-releases</id> из settings.xml совпадает с именем в pom.xml который на github.com.
+Заполняем:
 - ID: `maven-settings`
 - Name: `Maven Settings`
+
+Server Credentials
+- ServerID: `nexus`
+- Credentials: `nexus-creds`
 
 Содержимое:
 
@@ -2420,438 +2682,16 @@ Submit
 **Test:** Send test e-mail
 
 ---
+Примечание: После этого можно переходить к этапу **Этап 15: Запуск Pipeline**
 
 ## Этап 12: Создание Jenkins Pipeline
 
-### 12.1 Подготовка репозитория
+Мы создаем проект который будет брать настройки для разворачивания приложения в kubernetes с файла github.com/username/Boardgame/k8s_deployment.yaml. Аналогично другие настройки также лежат в файлах на github.
+Так как Jenkins копирует репозиторий с github в свой рабочий каталог, и в нем стоит режим работы через систему управления версиями кода SCM (git репозиторий), настройки из пунктов **12.1 Подготовка репозитория** и **9.2 Добавление Kubernetes манифестов** можно пропустить. Итого - работа Jenkins идет с github, а не с локальным каталогом кода.
+Можно продолжить настройку с **Этап 13: Установка мониторинга на Jenkins**
 
-На вашей локальной машине:
 
-```bash
-# Клонируйте оригинальный проект
-git clone https://github.com/jaiswaladi246/Boardgame.git
-cd Boardgame
-
-# Создайте свой приватный репозиторий на GitHub
-# Затем переключите origin
-git remote set-url origin https://github.com/YOUR_USERNAME/boardgame.git
-```
-
-### 9.2 Добавление Kubernetes манифестов
-
-Создайте файл `deployment.yaml`:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: boardgame
-  namespace: production
-  labels:
-    app: boardgame
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: boardgame
-  template:
-    metadata:
-      labels:
-        app: boardgame
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/actuator/prometheus"
-    spec:
-      containers:
-        - name: boardgame
-          image: harbor.local.lab/library/boardgame:latest   #  Harbor
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8080
-              name: http
-              protocol: TCP
-          env:
-            - name: SPRING_PROFILES_ACTIVE
-              value: "prod"
-          resources:
-            requests:
-              memory: "512Mi"
-              cpu: "500m"
-            limits:
-              memory: "1Gi"
-              cpu: "1000m"
-          livenessProbe:
-            httpGet:
-              path: /
-              port: 8080
-            initialDelaySeconds: 60
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 8080
-            initialDelaySeconds: 30
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 3
-      imagePullSecrets:
-        - name: harbor-registry-secret
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: boardgame-service
-  namespace: production
-  labels:
-    app: boardgame
-spec:
-  type: LoadBalancer
-  selector:
-    app: boardgame
-  ports:
-    - port: 80
-      targetPort: 8080
-      protocol: TCP
-      name: http
-  sessionAffinity: ClientIP
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: boardgame-ingress
-  namespace: production
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-spec:
-  ingressClassName: traefik
-  rules:
-    - host: boardgame.local.lab        # запись в локальном DNS, запись A с IP от metallb
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: boardgame-service
-                port:
-                  number: 80
-  tls:
-    - hosts:
-        - boardgame.local.lab          #  хост который в DNS
-      secretName: boardgame-tls
-
-```
-Создайте namespace с именем production:
-```bash
-sudo kubectl create namespace production
-```
-
-### 12.3 Обновление pom.xml
-
-Добавьте в `pom.xml` секцию `distributionManagement`, файл pom.xml  должен лежать в корне проекта на github:
-
-```xml
-<distributionManagement>
-    <repository>
-        <id>nexus-releases</id>
-        <name>Maven Releases Repository</name>
-        <url>http://nexus.local.lab:8081/repository/maven-releases/</url>
-    </repository>
-    <snapshotRepository>
-        <id>nexus-snapshots</id>
-        <name>Maven Snapshots Repository</name>
-        <url>http://nexus.local.lab:8081/repository/maven-snapshots/</url>
-    </snapshotRepository>
-</distributionManagement>
-```
-
-### 12.4 Создание Jenkinsfile
-
-Создайте файл `Jenkinsfile`:
-
-```groovy
-pipeline {
-    agent any
-    
-    tools {
-        jdk 'java17'
-        maven 'maven3.6'
-    }
-    
-    environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-        HARBOR_REGISTRY = 'harbor.your-domain.com'
-        HARBOR_PROJECT = 'library'
-        IMAGE_NAME = 'boardgame'
-        IMAGE_TAG = "${BUILD_NUMBER}"
-        FULL_IMAGE_NAME = "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
-        LATEST_IMAGE_NAME = "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest"
-    }
-    
-    stages {
-        stage('Git Checkout') {
-            steps {
-                git branch: 'main',
-                    credentialsId: 'github-token',
-                    url: 'https://github.com/YOUR_USERNAME/boardgame.git'
-            }
-        }
-        
-        stage('Compile') {
-            steps {
-                sh 'mvn clean compile'
-            }
-        }
-        
-        stage('Unit Tests') {
-            steps {
-                sh 'mvn test'
-            }
-            post {
-                always {
-                    junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
-                }
-            }
-        }
-        
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('sonar') {
-                    sh '''
-                        ${SCANNER_HOME}/bin/sonar-scanner \
-                        -Dsonar.projectName=BoardGame \
-                        -Dsonar.projectKey=BoardGame \
-                        -Dsonar.java.binaries=target/classes
-                    '''
-                }
-            }
-        }
-        
-        stage('Quality Gate') {
-            steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
-                }
-            }
-        }
-        
-        stage('Trivy FS Scan') {
-            steps {
-                sh '''
-                    trivy fs \
-                    --format table \
-                    --output trivy-fs-report.html \
-                    --severity HIGH,CRITICAL \
-                    --exit-code 0 \
-                    .
-                '''
-            }
-        }
-        
-        stage('Build Application') {
-            steps {
-                sh 'mvn clean package -DskipTests'
-            }
-        }
-        
-        stage('Publish to Nexus') {
-            steps {
-                configFileProvider([configFile(fileId: 'maven-settings', variable: 'MAVEN_SETTINGS')]) {
-                    sh 'mvn deploy -s $MAVEN_SETTINGS -DskipTests'
-                }
-            }
-        }
-        
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    sh """
-                        docker build -t ${FULL_IMAGE_NAME} .
-                        docker tag ${FULL_IMAGE_NAME} ${LATEST_IMAGE_NAME}
-                    """
-                }
-            }
-        }
-        
-        stage('Trivy Image Scan') {
-            steps {
-                sh """
-                    trivy image \
-                    --format table \
-                    --output trivy-image-report.html \
-                    --severity HIGH,CRITICAL \
-                    --exit-code 0 \
-                    ${FULL_IMAGE_NAME}
-                """
-            }
-        }
-        
-        stage('Push to Harbor') {
-            steps {
-                script {
-                    docker.withRegistry("https://${HARBOR_REGISTRY}", 'harbor-creds') {
-                        sh """
-                            docker push ${FULL_IMAGE_NAME}
-                            docker push ${LATEST_IMAGE_NAME}
-                        """
-                    }
-                }
-            }
-        }
-        
-        stage('Update Deployment Manifest') {
-            steps {
-                script {
-                    sh """
-                        sed -i 's|image:.*|image: ${FULL_IMAGE_NAME}|g' deployment.yaml
-                    """
-                }
-            }
-        }
-        
-        stage('Deploy to Kubernetes') {
-            steps {
-                script {
-                    withKubeConfig([credentialsId: 'k8s-kubeconfig']) {
-                        sh '''
-                            # Создание Harbor registry secret (если не существует)
-                            kubectl create secret docker-registry harbor-registry-secret \
-                              --docker-server=${HARBOR_REGISTRY} \
-                              --docker-username=admin \
-                              --docker-password=YOUR_HARBOR_PASSWORD \
-                              --namespace=default \
-                              --dry-run=client -o yaml | kubectl apply -f -
-                            
-                            # Применение deployment
-                            kubectl apply -f deployment.yaml
-                            
-                            # Ожидание завершения rollout
-                            kubectl rollout status deployment/boardgame -n default --timeout=5m
-                        '''
-                    }
-                }
-            }
-        }
-        
-        stage('Verify Deployment') {
-            steps {
-                script {
-                    withKubeConfig([credentialsId: 'k8s-kubeconfig']) {
-                        sh '''
-                            echo "=== Pods Status ==="
-                            kubectl get pods -n default -l app=boardgame
-                            
-                            echo "=== Service Status ==="
-                            kubectl get svc boardgame-service -n default
-                            
-                            echo "=== Ingress Status ==="
-                            kubectl get ingress boardgame-ingress -n default
-                            
-                            echo "=== Recent Events ==="
-                            kubectl get events -n default --sort-by='.lastTimestamp' | tail -10
-                        '''
-                    }
-                }
-            }
-        }
-    }
-    
-    post {
-        always {
-            // Архивация артефактов
-            archiveArtifacts artifacts: '**/target/*.jar', allowEmptyArchive: true
-            archiveArtifacts artifacts: 'trivy-*-report.html', allowEmptyArchive: true
-            
-            // Очистка workspace
-            cleanWs()
-        }
-        
-        success {
-            emailext(
-                subject: "✅ Pipeline Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                body: """
-                    <html>
-                    <body style="font-family: Arial, sans-serif;">
-                        <h2 style="color: #28a745;">🎉 Pipeline Executed Successfully!</h2>
-                        <table style="border-collapse: collapse; width: 100%;">
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build Number:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${env.BUILD_NUMBER}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Docker Image:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${FULL_IMAGE_NAME}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Application URL:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">
-                                    <a href="https://boardgame.apps.your-domain.com">https://boardgame.apps.your-domain.com</a>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build URL:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">
-                                    <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
-                                </td>
-                            </tr>
-                        </table>
-                        <p style="margin-top: 20px;">Check the attached Trivy security report for details.</p>
-                    </body>
-                    </html>
-                """,
-                to: 'your-email@example.com',
-                mimeType: 'text/html',
-                attachmentsPattern: 'trivy-image-report.html'
-            )
-        }
-        
-        failure {
-            emailext(
-                subject: "❌ Pipeline Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                body: """
-                    <html>
-                    <body style="font-family: Arial, sans-serif;">
-                        <h2 style="color: #dc3545;">❌ Pipeline Execution Failed!</h2>
-                        <table style="border-collapse: collapse; width: 100%;">
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build Number:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${env.BUILD_NUMBER}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Failed Stage:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${env.STAGE_NAME}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Console Output:</strong></td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">
-                                    <a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a>
-                                </td>
-                            </tr>
-                        </table>
-                        <p style="margin-top: 20px; color: #dc3545;">Please check the console output for detailed error information.</p>
-                    </body>
-                    </html>
-                """,
-                to: 'your-email@example.com',
-                mimeType: 'text/html'
-            )
-        }
-    }
-}
-```
-Получится следущий pipeline:
+Цепочка pipeline:
 ```mermaid
 graph TD
     A[Git Checkout] --> B[Compile]
@@ -2908,13 +2748,6 @@ graph TD
     classDef publish fill:#ffe0b2,stroke:#f57c00,stroke-width:2px
     classDef deploy fill:#
 ```
-### 12.5 Коммит и пуш изменений
-
-```bash
-git add .
-git commit -m "Add CI/CD pipeline configuration"
-git push origin main
-```
 
 ---
 
@@ -2924,7 +2757,8 @@ git push origin main
 
 ```bash
 ssh ubuntu@192.168.100.20
-
+```
+```bash
 # Скачивание Node Exporter
 cd /tmp
 wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
@@ -3184,57 +3018,6 @@ kubectl get secret jenkins-token -n default -o jsonpath='{.data.token}' | base64
 # Сохраните токен!
 ```
 
-### 14.3 Создание kubeconfig для Jenkins
-
-Создайте файл `create-jenkins-kubeconfig.sh`:
-
-```bash
-#!/bin/bash
-
-SERVICE_ACCOUNT=jenkins
-NAMESPACE=default
-SERVER_URL=https://192.168.100.10:6443
-
-# Получение токена
-TOKEN=$(kubectl get secret jenkins-token -n ${NAMESPACE} -o jsonpath='{.data.token}' | base64 -d)
-
-# Получение CA certificate
-kubectl get secret jenkins-token -n ${NAMESPACE} -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
-
-# Создание kubeconfig
-cat > jenkins-kubeconfig.yaml <<EOF
-apiVersion: v1
-kind: Config
-clusters:
-- name: k3s-cluster
-  cluster:
-    certificate-authority-data: $(kubectl get secret jenkins-token -n ${NAMESPACE} -o jsonpath='{.data.ca\.crt}')
-    server: ${SERVER_URL}
-contexts:
-- name: jenkins-context
-  context:
-    cluster: k3s-cluster
-    namespace: ${NAMESPACE}
-    user: jenkins
-current-context: jenkins-context
-users:
-- name: jenkins
-  user:
-    token: ${TOKEN}
-EOF
-
-echo "Kubeconfig created: jenkins-kubeconfig.yaml"
-```
-
-Выполнение:
-
-```bash
-chmod +x create-jenkins-kubeconfig.sh
-./create-jenkins-kubeconfig.sh
-
-# Обновите credentials в Jenkins этим файлом
-```
-
 ### 14.4 Network Policies (опционально)
 
 Создайте файл `network-policies.yaml`:
@@ -3280,15 +3063,16 @@ spec:
 ### 15.1 Создание Pipeline Job в Jenkins
 
 1. Jenkins → New Item
-2. Item name: `boardgame-pipeline`
+2. Item name: `boardgame`
 3. Type: **Pipeline**
 4. OK
 
 **General:**
-- ✓ GitHub project
-  - Project url: `https://github.com/YOUR_USERNAME/boardgame/`
 - ✓ Discard old builds
   - Max # of builds to keep: `10`
+- ✓ GitHub project
+  - Project url: `https://github.com/YOUR_USERNAME/boardgame/`
+
 
 **Build Triggers:**
 - ✓ GitHub hook trigger for GITScm polling
@@ -3302,6 +3086,7 @@ spec:
   - Script Path: `Jenkinsfile`
 
 **Save**
+<img width="1919" height="738" alt="image" src="https://github.com/user-attachments/assets/f5f1e156-189d-4d07-b5ad-d8ba2fd0b657" />
 
 ### 15.2 Настройка GitHub Webhook (опционально)
 
@@ -3343,7 +3128,8 @@ Running on Jenkins in /var/lib/jenkins/workspace/boardgame-pipeline
 - Jenkins → Open Blue Ocean
 - Красивый UI для просмотра pipeline
 
-<img width="1919" height="671" alt="image" src="https://github.com/user-attachments/assets/f27b62c3-0285-487f-ace6-9b863746a73a" />
+<img width="1916" height="991" alt="image" src="https://github.com/user-attachments/assets/ee9e1dde-3944-46b1-96d7-71066b84bd91" />
+
 
 ---
 
@@ -3495,6 +3281,327 @@ kubectl port-forward svc/boardgame-service 8080:80 -n default
 # Например, некорректный синтаксис
 # И запустите build
 ```
+
+Пример письма:
+<img width="1919" height="874" alt="image" src="https://github.com/user-attachments/assets/e728c7cd-83a8-4904-9511-9bab0c747837" />
+
+---
+
+## Этап 16.1: Настройка Gitops ArgoCD
+
+- Установка ArgoCD
+- Настройка доступа
+- Подготовка Git репозитория
+- Создание ArgoCD Application
+- Обновление Jenkins Pipeline
+- Проверка работы
+
+Установка ArgoCD, делаем на Jumphost'е:
+```bash
+# Создание namespace
+kubectl create namespace argocd
+
+# Установка ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Ожидание готовности
+kubectl wait --for=condition=available --timeout=300s deployment --all -n argocd
+
+# Проверка подов
+kubectl get pods -n argocd
+```
+Создаем argocd-service-lb.yaml:
+```bash
+sudo tee argocd-service-lb.yaml > /dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-lb
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-server
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.100.101   # выбераем свободный IP из пула Metallb, это приявязка статического IP к argocd, чтобы не менялся при перезагзуке
+  selector:
+    app.kubernetes.io/name: argocd-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: 8080
+      protocol: TCP
+EOF
+
+kubectl apply -f argocd-service-lb.yaml
+# Получение LoadBalancer IP
+kubectl get svc argocd-server-lb -n argocd
+# Запишите EXTERNAL-IP (например, 192.168.100.101)
+```
+**Добавление DNS записи**
+На DNS сервере (192.168.100.53):
+```bash
+echo "argocd          IN      A       192.168.100.101" >> /etc/bind/db.local.lab
+Обновите Serial и перезагрузите:
+sudo rndc reload
+```
+# Получение пароля admin на Jumphost:
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+echo
+```
+# Вход в ArgoCD UI
+Откройте браузер:
+Внутренний доступ: https://argocd.local.lab или http://192.168.100.101
+Внешний доступ: https://argocd.your-domain.com
+Логин: admin
+Пароль: (из команды выше)
+
+## Смена пароля admin в браузере через UI: User Info → Update Password
+Или через CLI:
+```bash
+# Установка ArgoCD CLI на jumphost
+curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x /usr/local/bin/argocd
+# Логин
+argocd login argocd.local.lab --username admin --password <initial-password>
+# Смена пароля
+argocd account update-password
+```
+Включите возможность генерации токенов для admin
+```bash
+# Получите текущий ConfigMap
+kubectl get configmap argocd-cm -n argocd -o yaml
+
+# Обновите ConfigMap
+kubectl patch configmap argocd-cm -n argocd --type merge -p '{"data":{"accounts.admin":"apiKey"}}'
+```
+### Создание токена (срок действия 1 год)
+```bash
+argocd account generate-token --account admin
+```
+или
+### Сохраните этот токен!
+Перейди в Jenkins: 
+```
+Manage Jenkins → Credentials → System → Global credentials.
+Создайте запись с ID argocd-token.
+Тип: Secret text (если используешь токен)
+Значение: твой токен ArgoCD
+ID: argocd-token (точно как в pipeline)
+Если запись отсутствует — создай её.
+После этого Jenkins сможет подставлять токен в pipeline.
+```
+
+
+## Подготовка Git репозитория
+
+### Структура репозитория
+
+Создайте репозиторий boardgame-gitops для манифестов:
+```
+boardgame-gitops/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── ingress.yaml
+└── overlays/
+    ├── dev/
+    │   └── kustomization.yaml
+    └── production/
+        └── kustomization.yaml
+```
+
+Внутри него нужно создать файлы и каталоги:
+base/kustomization.yaml
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+commonLabels:
+  app: boardgame
+  managed-by: argocd
+```
+base/deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boardgame-deployment
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: boardgame
+  template:
+    metadata:
+      labels:
+        app: boardgame
+    spec:
+      containers:
+        - name: boardgame
+          image: harbor.local.lab/library/myapp:latest  # Будет обновляться Jenkins
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 5
+      imagePullSecrets:
+        - name: harbor-registry-secret
+```
+
+base/service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: boardgame-service
+  namespace: production
+spec:
+  type: LoadBalancer
+  selector:
+    app: boardgame
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+```
+base/ingress.yaml
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: boardgame-ingress
+  namespace: production
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: boardgame.local.lab
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: boardgame-service
+                port:
+                  number: 80
+```
+overlays/production/kustomization.yaml
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+  - ../../base
+
+namespace: production
+
+replicas:
+  - name: boardgame-deployment
+    count: 2
+```
+## Создание ArgoCD Application
+Подключение Git репозитория
+В ArgoCD UI:
+
+Settings → Repositories → Connect Repo
+Выберите метод: HTTPS
+Repository URL: https://github.com/YOUR_USERNAME/boardgame-gitops.git
+Username: (ваш GitHub username)
+Password: (Personal Access Token)
+Connect
+
+## Создание Application через UI
+Applications → New App
+Заполните поля:
+
+yamlApplication Name: boardgame
+Project: default
+Sync Policy: Manual (пока)
+
+Source:
+  Repository URL: https://github.com/sysops8/boardgame-gitops.git
+  Revision: HEAD
+  Path: overlays/production
+
+Destination:
+  Cluster URL: https://kubernetes.default.svc
+  Namespace: production
+
+Нажать CREATE
+
+Создание Application через YAML
+Создайте файл argocd-application.yaml:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: boardgame
+  namespace: argocd
+spec:
+  project: default
+  
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/boardgame-gitops.git
+    targetRevision: HEAD
+    path: overlays/production
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+Применение:
+```bash
+kubectl apply -f argocd-application.yaml
+```
+
+
+
 
 ---
 
@@ -4505,7 +4612,7 @@ sudo rndc reload
 
 **Автор:** Sysops8
 **Email:** almastvx@gmail.com
-**GitHub:** [@sysops8](https://github.com/sysops8)  
+**GitHub:** [@yourusername](https://github.com/sysops8)  
 
 
 ---
@@ -4600,9 +4707,9 @@ traceroute 8.8.8.8  # Должен идти через 192.168.100.60
 
 ---
 
+---
 
-
-
+*Последнее обновление: 2025*
 
 *Версия: 1.0.0*
                 
