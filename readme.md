@@ -3286,7 +3286,7 @@ kubectl port-forward svc/boardgame-service 8080:80 -n default
 <img width="1919" height="874" alt="image" src="https://github.com/user-attachments/assets/e728c7cd-83a8-4904-9511-9bab0c747837" />
 
 
-И можно проверить с какого образа поднялись 
+И можно проверить с какого образа поднялись поды:
 <img width="1550" height="209" alt="image" src="https://github.com/user-attachments/assets/c7d47c12-3b65-496d-adb9-842137fa37b5" />
 
 <img width="1890" height="147" alt="image" src="https://github.com/user-attachments/assets/2659b8dc-6338-48d2-b6c0-629385c43976" />
