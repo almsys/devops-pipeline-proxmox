@@ -1,4 +1,4 @@
-# The Ultimate CI/CD Corporate DevOps Pipeline Project (v4)
+# The Ultimate CI/CD Corporate DevOps Pipeline Project
 
 ## Полное руководство по развертыванию enterprise-grade CI/CD инфраструктуры в Proxmox с изолированной сетью
 
