@@ -1,4 +1,4 @@
-# The Ultimate CI/CD Corporate DevOps Pipeline Project
+# The Ultimate CI/CD Corporate DevOps Pipeline Project (v4)
 
 ## Полное руководство по развертыванию enterprise-grade CI/CD инфраструктуры в Proxmox с изолированной сетью
 
@@ -2679,8 +2679,267 @@ Submit
 ## Этап 12: Создание Jenkins Pipeline
 
 Мы создаем проект который будет брать настройки для разворачивания приложения в kubernetes с файла github.com/username/Boardgame/k8s_deployment.yaml. Аналогично другие настройки также лежат в файлах на github.
-Так как Jenkins копирует репозиторий с github в свой рабочий каталог, и в нем стоит режим работы через систему управления версиями кода SCM (git репозиторий), настройки из пунктов **12.1 Подготовка репозитория** и **9.2 Добавление Kubernetes манифестов** можно пропустить. Итого - работа Jenkins идет с github, а не с локальным каталогом кода.
-Можно продолжить настройку с **Этап 13: Установка мониторинга на Jenkins**
+Рабочий pipeline должен лежать в корне вашего проекта на репозитории, у меня он лежит в на githube.com -  https://github.com/sysops8/Boardgame/Jenkinsfile
+В Jenkinsfile описывается весь весь CI/CD процесс, то есть Build, Test и Deploy.
+Пример файла:
+```Jenkinsfile
+pipeline {
+    agent any
+
+    environment {
+        MYAPP = "boardgame"
+
+        // Harbor
+        HARBOR_URL = "harbor.local.lab"
+        HARBOR_PROJECT = "library"
+        HARBOR_CREDENTIALS = "harbor-creds"
+        
+        // Harbor image name
+        IMAGE_NAME = 'boardgame'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        FULL_IMAGE_NAME = "${HARBOR_URL}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
+        LATEST_IMAGE_NAME = "${HARBOR_URL}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest"
+        
+        // Nexus
+        NEXUS_URL = "http://nexus.local.lab:8081/repository/maven-releases/"
+        NEXUS_CREDENTIALS = "nexus-creds"
+
+        // SonarQube
+        SONARQUBE_SERVER = "SonarQube"
+        SONARQUBE_URL = "http://sonar.local.lab:9000"
+        SONARQUBE_CREDENTIALS = "sonar-token"
+
+        // Kubernetes
+        KUBECONFIG_CREDENTIALS = "k8s-kubeconfig"
+
+        // Email
+        EMAIL_RECIPIENTS = "almastvx@gmail.com"        
+
+
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+    stage('Set Build Version') {
+        steps {
+            script {
+                sh "mvn versions:set -DnewVersion=0.0.${env.BUILD_NUMBER}"                
+            }
+        }
+    }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    dockerImage = docker.build("${HARBOR_URL}/${HARBOR_PROJECT}/${MYAPP}:${env.BUILD_NUMBER}")
+                    
+                }
+            }
+        }
+
+        stage('Push Docker Image to Harbor') {
+            steps {
+                script {
+                    docker.withRegistry("http://${HARBOR_URL}", HARBOR_CREDENTIALS) {
+                        dockerImage.push()
+                        dockerImage.push('latest') // optional
+                    }
+                }
+            }
+        }
+
+        stage('Publish Artifacts to Nexus') {
+            steps {
+                echo "📤 Publishing Maven artifacts to Nexus..."
+                configFileProvider([configFile(fileId: 'maven-settings', variable: 'MAVEN_SETTINGS')]) {
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PSW')]) {
+                        sh """
+                            mvn clean deploy -s $MAVEN_SETTINGS \
+                                -DaltDeploymentRepository=nexus::default::${NEXUS_URL} \
+                                -Dnexus.username=${NEXUS_USER} \
+                                -Dnexus.password=${NEXUS_PSW}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_SERVER}") {
+                    sh "mvn sonar:sonar -Dsonar.host.url=${SONARQUBE_URL}"
+                }
+            }
+        }
+
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false, credentialsId: "${SONARQUBE_CREDENTIALS}"
+                }
+            }
+        }
+        
+        stage('Update K8s Manifest') {
+            steps {
+                script {
+                    echo "📝 Updating Kubernetes manifest with image: ${HARBOR_URL}/${HARBOR_PROJECT}/${MYAPP}:${env.BUILD_NUMBER}"
+        
+                    // Используем безопасную оболочку без Groovy-интерполяции
+                    sh '''
+                        IMAGE_TAG="${HARBOR_URL}/${HARBOR_PROJECT}/${MYAPP}:${BUILD_NUMBER}"
+                        if [ ! -f k8s_deployment-service.yaml ]; then
+                            echo "❌ File k8s_deployment-service.yaml not found!"
+                            exit 1
+                        fi
+                        echo "Updating image to: $IMAGE_TAG"
+                        sed -i "0,/image:/s|image: .*|image: $IMAGE_TAG|" k8s_deployment-service.yaml
+                        #sed -i 's|newTag:.*|newTag: "'${BUILD_NUMBER}'"|g' k8s_deployment-service.yaml
+                        echo "✅ Manifest updated successfully:"
+                        grep "image:" k8s_deployment-service.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
+                    sh """
+                        export KUBECONFIG=${KUBECONFIG_FILE}
+                        kubectl apply -f k8s_deployment-service.yaml
+                    """
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "🩺 Checking application health..."
+                    withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
+                        sh '''
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            kubectl wait --for=condition=available --timeout=60s deployment/boardgame-deployment
+                            kubectl get pods -o wide | grep boardgame
+                            kubectl wait --for=condition=ready pod -l app=boardgame -n default --timeout=60s  
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
+                    sh """
+                        export KUBECONFIG=${KUBECONFIG_FILE}
+                        kubectl rollout status deployment/boardgame-deployment
+                    """
+                }
+            }
+        }
+    }
+
+        post {
+                always {
+                    // Архивация артефактов
+                    archiveArtifacts artifacts: '**/target/*.jar', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'trivy-*-report.html', allowEmptyArchive: true
+                    
+                    // Очистка workspace
+                    cleanWs()
+                }
+                
+                success {
+                    echo "🎉 Pipeline completed successfully!"
+                    echo "📧 Sending success notification..."              
+                    
+                    emailext(
+                        subject: "✅ Pipeline Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <html>
+                            <body style="font-family: Arial, sans-serif;">
+                                <h2 style="color: #28a745;">🎉 Pipeline Executed Successfully!</h2>
+                                <table style="border-collapse: collapse; width: 100%;">
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build Number:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.BUILD_NUMBER}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Docker Image:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${FULL_IMAGE_NAME}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Application URL:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">
+                                            <a href="https://boardgame.apps.local.lab">https://boardgame.apps.local.lab</a>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build URL:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">
+                                            <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
+                                        </td>
+                                    </tr>
+                                </table>
+                                <p style="margin-top: 20px;">Check the attached Trivy security report for details.</p>
+                            </body>
+                            </html>
+                        """,
+                        to: EMAIL_RECIPIENTS,
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'trivy-image-report.html'
+                    )
+                }
+                
+                failure {
+                    emailext(
+                        subject: "❌ Pipeline Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <html>
+                            <body style="font-family: Arial, sans-serif;">
+                                <h2 style="color: #dc3545;">❌ Pipeline Execution Failed!</h2>
+                                <table style="border-collapse: collapse; width: 100%;">
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build Number:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.BUILD_NUMBER}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Failed Stage:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">${env.STAGE_NAME}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 8px; border: 1px solid #ddd;"><strong>Console Output:</strong></td>
+                                        <td style="padding: 8px; border: 1px solid #ddd;">
+                                            <a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a>
+                                        </td>
+                                    </tr>
+                                </table>
+                                <p style="margin-top: 20px; color: #dc3545;">Please check the console output for detailed error information.</p>
+                            </body>
+                            </html>
+                        """,
+                        to: EMAIL_RECIPIENTS,
+                        mimeType: 'text/html'
+                    )
+                }
+            }
+}
+```
 
 
 Цепочка pipeline:
@@ -3280,6 +3539,12 @@ kubectl port-forward svc/boardgame-service 8080:80 -n default
 ---
 ## Часть 5: Опционально настройка GitOps
 
+Подключитесь к Jumphost серверу:
+```bash
+ssh admin@j192.168.100.5
+# или
+ssh admin@jumphost.local.lab
+```
 ## Этап 16.1: Настройка Gitops ArgoCD
 
 - Установка ArgoCD
@@ -3289,11 +3554,24 @@ kubectl port-forward svc/boardgame-service 8080:80 -n default
 - Обновление Jenkins Pipeline
 - Проверка работы
 
+Удаляем старые pods в namespace default чтобы потом их создавать в production:
+```bash
+kubectl delete pod -l app=boardgame
+```
+```
+pod "boardgame-deployment-5d8c66bb9-jwv9f" deleted from default namespace
+pod "boardgame-deployment-5d8c66bb9-m8ptf" deleted from default namespace
+```
+Создаем новый namespace production:
+```bash
+kubectl create namespace production
+```
+
 Установка ArgoCD, делаем на Jumphost'е:
 ```bash
 # Создание namespace
 kubectl create namespace argocd
-
+kubectl create namespace production
 # Установка ArgoCD
 kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
@@ -3305,7 +3583,7 @@ kubectl get pods -n argocd
 ```
 Создаем argocd-service-lb.yaml:
 ```bash
-sudo tee argocd-service-lb.yaml > /dev/null <<EOF
+sudo tee argocd-service-lb.yaml > /dev/null <<'EOF'
 apiVersion: v1
 kind: Service
 metadata:
@@ -3315,7 +3593,7 @@ metadata:
     app.kubernetes.io/name: argocd-server
 spec:
   type: LoadBalancer
-  loadBalancerIP: 192.168.100.101   # выбераем свободный IP из пула Metallb, это приявязка статического IP к argocd, чтобы не менялся при перезагзуке
+  loadBalancerIP: 192.168.100.105   # выбераем свободный IP из пула Metallb, это приявязка статического IP к argocd, чтобы не менялся при перезагзуке
   selector:
     app.kubernetes.io/name: argocd-server
   ports:
@@ -3332,12 +3610,95 @@ EOF
 kubectl apply -f argocd-service-lb.yaml
 # Получение LoadBalancer IP
 kubectl get svc argocd-server-lb -n argocd
-# Запишите EXTERNAL-IP (например, 192.168.100.101)
+# Запишите EXTERNAL-IP (например, 192.168.100.105)
 ```
+Примечание: Здесь указываем внешний IP адрес на котором будет работать Argocd, запрашиваем IP у MetalLB из его диапозона 192.168.100.100-150. Важно чтобы адрес был не занятый, у нас 100 принадлжеит Traefik и 101 у приложения Boargame, значить мы можем взять IP все что выше 102. Если указать уже занятый IP, то можно при выводе сервиса get svc -n argocd увидеть PENDING вместо IP например 192.168.100.105. То есть нельзя использовать уже занятые IP 100 и 101.
+
+**Добавление RBAC политик**
+
+Создание или обновление ConfigMap с необходимыми политиками:
+```yaml
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-rbac-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  policy.csv: |
+    g, admin, role:admin
+    p, role:admin, applications, *, */*, allow
+    p, role:admin, clusters, get, *, allow
+    p, role:admin, repositories, get, *, allow
+    p, role:admin, projects, get, *, allow
+  policy.default: role:readonly
+EOF
+```
+Проверка:
+```bash
+kubectl get configmap argocd-rbac-cm -n argocd -o yaml
+```
+Вывод:
+```
+admin@jumphost:~$ kubectl get configmap argocd-rbac-cm -n argocd -o yaml
+apiVersion: v1
+data:
+  policy.csv: |
+    g, admin, role:admin
+    p, role:admin, applications, *, */*, allow
+    p, role:admin, clusters, get, *, allow
+    p, role:admin, repositories, get, *, allow
+    p, role:admin, projects, get, *, allow
+  policy.default: role:readonly
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"policy.csv":"g, admin, role:admin\np, role:admin, applications, *, */*, allow\np, role:admin, clusters, get, *, allow\np, role:admin, repositories, get, *, allow\np, role:admin, projects, get, *, allow\n","policy.default":"role:readonly"},"kind":"ConfigMap","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"argocd-rbac-cm","app.kubernetes.io/part-of":"argocd"},"name":"argocd-rbac-cm","namespace":"argocd"}}
+  creationTimestamp: "2025-11-08T10:07:00Z"
+  labels:
+    app.kubernetes.io/name: argocd-rbac-cm
+    app.kubernetes.io/part-of: argocd
+  name: argocd-rbac-cm
+  namespace: argocd
+  resourceVersion: "16354"
+  uid: b416cca7-191b-4815-9667-ad3ea2d0f9c6
+
+```
+Перезапуск Argocd (важно):
+```
+kubectl rollout restart deployment argocd-server -n argocd
+```
+
+Создание приложение в production namespace, раньше был в default, перенесем его туда:
+```
+argocd app create boardgame \
+  --repo https://github.com/sysops8/boardgame-gitops.git \
+  --path apps/boardgame \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace production \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal \
+  --server argocd.local.lab \
+  --auth-token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcmdvY2QiLCJzdWIiOiJhZG1pbjphcGlLZXkiLCJuYmYiOjE3NjI2MDgyMzMsImlhdCI6MTc2MjYwODIzMywianRpIjoiMWFmZWNmZjEtNGFlNS00MzZkLWFhOTEtYzY5OWJiOTk1OTcyIn0.OSluIoqwI6w_5wOqy8cyTUe5wp5l6Nwp0LLmAJH4YHs" \
+  --grpc-web \
+  --insecure
+```
+Здесь важные параметры:
+- repo - Репозитори GitOps
+- path - путь внутри репозитория GitOps к файлам развертывания
+- dest - в каком NS разворачивать приложение
+- sync-policy - тип синхронизации
+- auth-token - токен который мы получаем через команду `argocd account generate-token --account admin`
+
 **Добавление DNS записи**
 На DNS сервере (192.168.100.53):
 ```bash
-echo "argocd          IN      A       192.168.100.101" >> /etc/bind/db.local.lab
+echo "argocd          IN      A       192.168.100.105" >> /etc/bind/db.local.lab
 Обновите Serial и перезагрузите:
 sudo rndc reload
 ```
@@ -3348,12 +3709,12 @@ echo
 ```
 **Вход в ArgoCD UI**
 Откройте браузер:
-Внутренний доступ: https://argocd.local.lab или http://192.168.100.101
+Внутренний доступ: https://argocd.local.lab или http://192.168.100.105
 Внешний доступ: https://argocd.your-domain.com
 Логин: admin
 Пароль: (из команды выше)
 
-### Смена пароля admin в браузере через UI: User Info → Update Password
+**Смена пароля admin в браузере через UI: User Info → Update Password**
 Или через CLI:
 ```bash
 # Установка ArgoCD CLI на jumphost
@@ -3379,15 +3740,23 @@ argocd account generate-token --account admin
 или
 ### Сохраните этот токен!
 Перейди в Jenkins: 
-```
-Manage Jenkins → Credentials → System → Global credentials.
-Создайте запись с ID argocd-token.
-Тип: Secret text (если используешь токен)
-Значение: твой токен ArgoCD
-ID: argocd-token (точно как в pipeline)
-Если запись отсутствует — создай её.
-После этого Jenkins сможет подставлять токен в pipeline.
-```
+
+Создайте учетную запись для ArgoCD доступа к Gitops repo:
+- Manage Jenkins → Credentials → System → Global credentials.
+- Создайте запись с ID github-gitops-token.
+- Тип: Username with password
+- Username: Ваш логин к github gitops репозиторий, у меня здесь sysops8
+- Password: github settings -> Developer Setting -> Personal Access Token -> Classic toker -> Create -> github-argocd-token
+
+Создайте учетную запись для Jenkins чтобы он мог вызывать синхронизацию argocd в pipeline:
+- Manage Jenkins → Credentials → System → Global credentials.
+- Создайте запись с ID argocd-token.
+- Тип: Secret text (если токен)
+- Значение: твой токен ArgoCD
+- ID: argocd-token (точно как в pipeline)
+- Если запись отсутствует — нужно создать её.
+- После этого Jenkins сможет подставлять токен в pipeline.
+
 
 
 ## Подготовка Git репозитория
@@ -3593,7 +3962,366 @@ spec:
 kubectl apply -f argocd-application.yaml
 ```
 
+## Обновление Jenkins Pipeline
+Вот обновленный Jenkinsfile с добавлением gitops, файл должен лежать в корне вашего Git репозитория.
+Получается теперь Jenkins делаетс стадии:
+- Build
+- Test
+- Save to container repository
+- Заходить в репозиторий Gitops -> Boardgame-GitOps ->  меняет тэг версии в файле /boardgame/kustomization.yaml
+- ArgoCD проверяет свой gitops репозиторий и види что сменилась версия контейнера, далее закачивает новый контейнер разворачивает в k8s
 
+
+```Jenkinsfile
+pipeline {
+    agent any
+    environment { 
+        // AppName
+        MY_APP = 'boardgame'
+        
+        // Harbor
+        HARBOR_URL = "harbor.local.lab"
+        HARBOR_PROJECT = "library"
+        HARBOR_CREDENTIALS = "harbor-creds"
+
+        // Nexus
+        NEXUS_URL = "http://nexus.local.lab:8081/repository/maven-releases/"
+        NEXUS_CREDENTIALS = "nexus-creds"
+
+        // SonarQube
+        SONARQUBE_SERVER = "SonarQube"
+        SONARQUBE_URL = "http://sonar.local.lab:9000"
+        SONARQUBE_CREDENTIALS = "sonar-token"
+        
+        // Kubernetes
+        KUBECONFIG_CREDENTIALS = "k8s-kubeconfig"
+
+        // Email
+        EMAIL_RECIPIENTS = "almastvx@gmail.com"
+
+        // ArgoCD
+        ARGOCD_SERVER = "argocd.local.lab"
+        ARGOCD_CREDENTIALS = "argocd-token"
+        GITOPS_REPO = "https://github.com/sysops8/Boardgame-gitops.git"  
+        GITOPS_CREDENTIALS = "github-gitops-token"
+        GITOPS_KUSTOMIZATION_PATH = "apps/boardgame/kustomization.yaml"
+
+        // Image 
+        IMAGE_NAME = "${HARBOR_URL}/${HARBOR_PROJECT}/boardgame"
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+       
+
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                sh 'mvn clean compile'
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh 'mvn test'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+                sh '''
+                    trivy fs \
+                        --format table \
+                        --output trivy-fs-report.html \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        .
+                '''
+            }
+        }
+
+        stage('Set Build Version') {
+            steps {
+                script {
+                    sh "mvn versions:set -DnewVersion=0.0.${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    dockerImage = docker.build("${HARBOR_URL}/${HARBOR_PROJECT}/${MY_APP}:${env.BUILD_NUMBER}")
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh """
+                    trivy image \
+                        --format table \
+                        --output trivy-image-report.html \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        ${HARBOR_URL}/${HARBOR_PROJECT}/${MY_APP}:${env.BUILD_NUMBER}
+                """
+            }
+        }
+
+        stage('Push Docker Image to Harbor') {
+            steps {
+                script {
+                    docker.withRegistry("http://${HARBOR_URL}", HARBOR_CREDENTIALS) {
+                        dockerImage.push()
+                        dockerImage.push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('Publish Artifacts to Nexus') {
+            steps {
+                echo "📤 Publishing Maven artifacts to Nexus..."
+                configFileProvider([configFile(fileId: 'maven-settings', variable: 'MAVEN_SETTINGS')]) {
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PSW')]) {
+                        sh """
+                            mvn clean deploy -s $MAVEN_SETTINGS \
+                                -DaltDeploymentRepository=nexus::default::${NEXUS_URL} \
+                                -Dnexus.username=${NEXUS_USER} \
+                                -Dnexus.password=${NEXUS_PSW}
+                        """
+                    }
+                }
+            }
+        }
+
+         stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_SERVER}") {
+                    sh """
+                        mvn sonar:sonar -Dsonar.host.url=${SONARQUBE_URL} \
+                        -Dsonar.projectName=${MY_APP} \
+                        -Dsonar.projectKey=${MY_APP} \
+                        -Dsonar.host.url=${SONARQUBE_URL} \
+                        -Dsonar.java.binaries=target/classes
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false, credentialsId: "${SONARQUBE_CREDENTIALS}"
+                }
+            }
+        }
+
+        stage('Update GitOps Repository') {
+            steps {
+                script {
+                    echo "🚀 Updating GitOps repository with new image version..."
+                    
+                    withCredentials([usernamePassword(credentialsId: GITOPS_CREDENTIALS, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        sh '''
+                            git clone https://$GIT_USER:$GIT_TOKEN@github.com/sysops8/Boardgame-gitops.git gitops-repo
+                            cd gitops-repo
+
+                            echo "=== Updating image version ==="
+                            sed -i 's|newTag:.*|newTag: "'${BUILD_NUMBER}'"|g' ${GITOPS_KUSTOMIZATION_PATH}
+                            git config user.email "jenkins@local.lab"
+                            git config user.name "Jenkins CI"
+                            git add ${GITOPS_KUSTOMIZATION_PATH}
+                            git commit -m "Deploy ${MY_APP} version '${BUILD_NUMBER}'"
+                            git push origin main
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Sync ArgoCD Application') {
+            steps {
+                script {
+                    echo "🔄 Synchronizing ArgoCD application..."
+                    withCredentials([string(credentialsId: ARGOCD_CREDENTIALS, variable: 'ARGOCD_TOKEN')]) {
+                        sh '''
+                            argocd app sync $MY_APP --server ${ARGOCD_SERVER} --auth-token ${ARGOCD_TOKEN} --grpc-web --insecure
+                            argocd app get "$MY_APP" --server ${ARGOCD_SERVER} --auth-token ${ARGOCD_TOKEN} --grpc-web --insecure
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "🩺 Checking application health..."
+                    withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {
+                        sh '''                
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            # Короткое ожидание готовности
+                            kubectl wait --for=condition=ready \
+                            pod -l app=boardgame,managed-by=argocd \
+                            -n production \
+                            --timeout=60s  
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                withCredentials([file(credentialsId: KUBECONFIG_CREDENTIALS, variable: 'KUBECONFIG_FILE')]) {                    
+                    sh """
+                        echo "✅ Verifying deployment in Kubernetes..."
+                        export KUBECONFIG=${KUBECONFIG_FILE}
+                        kubectl rollout status deployment/boardgame-deployment    
+                        echo "Checking pods..."
+                        kubectl get pods -n production -l app=boardgame -o wide
+                        
+                        echo "Checking deployment rollout status..."
+                        kubectl rollout status deployment/boardgame-deployment -n production --timeout=300s
+                        
+                        echo "Checking services..."
+                        kubectl get svc -n production -l app=boardgame
+                        
+                        echo "Checking replica status..."
+                        kubectl get deployment boardgame-deployment -n production -o jsonpath='{.status.availableReplicas}/{.status.replicas} pods available'
+                        echo ""
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def appUrl = "http://boardgame.local.lab"
+                def argocdUrl = "https://${ARGOCD_SERVER}/applications/boardgame"
+                
+                echo "🎉 Pipeline completed successfully!"
+                echo "📧 Sending success notification..."
+                
+                emailext(
+                    subject: "✅ SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <html>
+                        <body style="font-family: Arial, sans-serif;">
+                            <h2 style="color: #28a745;">🎉 Pipeline Executed Successfully!</h2>
+                            <table style="border-collapse: collapse; width: 100%;">
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">#${env.BUILD_NUMBER}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Docker Image:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">${IMAGE_NAME}:${IMAGE_TAG}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Application:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">
+                                        <a href="${appUrl}">${appUrl}</a>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>ArgoCD:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">
+                                        <a href="${argocdUrl}">${argocdUrl}</a>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build URL:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">
+                                        <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
+                                    </td>
+                                </tr>
+                            </table>
+                            <p style="margin-top: 20px;">
+                                <strong>Deployed by ArgoCD via GitOps</strong><br>
+                                GitOps Repo: ${GITOPS_REPO}
+                            </p>
+                        </body>
+                        </html>
+                    """,
+                    to: EMAIL_RECIPIENTS,
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivy-report.txt'
+                )
+            }
+        }
+        failure {
+                    echo "❌ Pipeline failed!"
+                    emailext(
+                    subject: "❌ FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <html>
+                        <body style="font-family: Arial, sans-serif;">
+                            <h2 style="color: #dc3545;">❌ Pipeline Failed!</h2>
+                            <table style="border-collapse: collapse; width: 100%;">
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Job:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">${env.JOB_NAME}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Build:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">#${env.BUILD_NUMBER}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Failed Stage:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">${env.STAGE_NAME}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Console:</strong></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">
+                                        <a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a>
+                                    </td>
+                                </tr>
+                            </table>
+                        </body>
+                        </html>
+                    """,
+                    to: EMAIL_RECIPIENTS,
+                    mimeType: 'text/html'
+                    )
+        }
+        unstable {
+            mail to: "${EMAIL_RECIPIENTS}",
+                subject: "⚠️ UNSTABLE: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: "The Jenkins job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' is unstable.\nBuild URL: ${env.BUILD_URL}"
+        }
+        always {
+            archiveArtifacts artifacts: 'trivy-*-report.html', allowEmptyArchive: true
+            cleanWs()
+        }
+    }
+}
+```
+Если все работает хорошо, то мы получим сообщение на почту:
+<img width="1834" height="797" alt="image" src="https://github.com/user-attachments/assets/a2a81fd0-36fb-4a20-9f68-9f7885b93abe" />
+
+Pipeline:
+<img width="1920" height="995" alt="image" src="https://github.com/user-attachments/assets/1e605e30-95be-4494-ac69-2f2f536d994a" />
 
 
 ---
