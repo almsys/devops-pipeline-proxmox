@@ -1,7 +1,7 @@
-#### Создайте новый репозиторий Boardgame-gitops (например https://github.com/<yourname>/Boardgame-gitops)
+#### Создайте новый репозиторий Boardgame-gitops (например https://github.com/yourname/Boardgame-gitops)
 - Скопируйте туда директори apps, base, overlays в корень
 - Переименуйте файл jenkinsfile(version with argo) в jenkinsfile
-- Замените jenkinsfile в репозитории проекта Boardgame - https://github.com/<yourname>/Boardgame)
+- Замените jenkinsfile в репозитории проекта Boardgame - https://github.com/yourname/Boardgame)
 - Запустите pipeline в jenkins чтобы он выполнил этапы из нового файла jenkinsfile
 - После выполнения получится примерно так:
 <img width="1900" height="919" alt="image" src="https://github.com/user-attachments/assets/7418f5bc-bebf-4d97-9b79-cafa10b46e33" />
