@@ -3122,13 +3122,17 @@ subjects:
     name: prometheus
     namespace: kube-system    
 ```
+```bash
 kubectl apply -f prometheus-rbac.yaml
-Если есть роль для Prometheus удаляем ее 
+```
+Если есть роль для Prometheus удаляем ее:
+```bash
 kubectl delete clusterrolebinding prometheus
-и добавляем
+# и добавляем
 kubectl apply -f prometheus-rbac.yaml
-Генерим токен -
+# Генерим токен -
 kubectl -n kube-system create token prometheus
+```
 
 
 
